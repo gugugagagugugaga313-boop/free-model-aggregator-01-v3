@@ -1,1734 +1,1967 @@
-// Free-model aggregator, third attempt: hazard-aware routing.
+// free-model-aggregator-01 — a routing gateway over ten simulated free-tier providers.
 //
-// One server, two client wires (OpenAI + Anthropic), ten upstream providers
-// (OpenAI, Anthropic and Gemini wires). Every request is normalized once,
-// forwarded to the best free model that meets its requirements, and the
-// provider's answer is re-emitted in the client's wire with its usage
-// verbatim and a stop reason from the same family.
+// The trial hands this program a brief (three JSON documents found by a schema member: the
+// provider directory, the quality table, the workload manifest) and an env URL. It probes
+// every provider's catalog route, registers one catalog, then answers the client's twenty
+// requests, one at a time, each with the strongest free model that meets the request's
+// requirements and still has budget on its provider. When a provider refuses, the request
+// is answered by another model; a refusal is never the answer.
 //
-// Routing is the whole game. Upstream failures are scheduled per provider:
-// each provider's free-tier budget is drawn from a published range, one or
-// two of its calls refuse transiently, and one provider goes out mid-trial.
-// A provider's first call never refuses. So the router prices every
-// candidate by the hazard of its NEXT call ordinal — derived from the
-// published budget ranges and the transient refusals seen so far — and
-// scores weight-1 requests by rating minus 300 times that hazard, which
-// spreads load onto fresh, low-ordinal providers instead of hammering the
-// top-rated ladder until it breaks. Weight-2 requests keep pure rating
-// order: they carry double weight, so a rating sacrifice there costs twice
-// as much quality. After a transient refusal the router retries the SAME
-// provider once immediately — a refused ordinal is spent, so the next
-// ordinal's conditional hazard is low, and the request stays on its
-// high-rated provider instead of cascading down. Terminal refusals (spent
-// budget, outage) retire the provider for the rest of the trial.
+// Architecture: every request is first normalised into one canonical shape (system text,
+// turns, tools, stops, caps, JSON mode, streaming), whatever wire the client used. That
+// shape is then rendered into the chosen provider's wire (OpenAI, Anthropic, or Gemini),
+// and the provider's answer is normalised into one canonical answer (text, token counts,
+// stop family) and rendered back into the client's wire. Same-wire pairs skip the round
+// trip and pass the provider's bytes through untouched. Nothing here reads the wall clock
+// and nothing is random: the same requests and the same provider answers always produce
+// the same bytes, so a replay reproduces the trial exactly.
 //
-// Deterministic: no wall clock, no randomness; every choice derives from
-// the brief, the requests and the providers' answers.
-//
-// Usage: node main.ts [--list]
-//   --list prints the catalog document and exits 0 without starting a server.
+// Routing: each provider carries a tally of attempts and transient refusals. A provider's
+// budget for the trial is drawn uniformly from a small published window, it refuses a
+// couple of early calls on a hidden schedule, and exactly one provider in ten goes dark
+// partway through; the hazard estimate prices all three risks from what has been observed
+// so far. Full-weight requests take the highest-rated model outright; lighter requests
+// take the highest rating minus a hazard penalty, which spreads calls away from providers
+// that are about to run dry. A transient refusal earns the same provider one immediate
+// retry — the hidden failure schedule is sparse, so the second attempt usually lands —
+// while a message that says the budget is spent or the provider is out retires that
+// provider for the rest of the trial. Requests that need JSON mode never go to a wire
+// that cannot carry it, because such a provider echoes JSON mode as absent and the
+// request would fail its echo check.
 
-import { createServer } from "node:http";
-import type { IncomingMessage, ServerResponse } from "node:http";
-import { readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { readFileSync } from 'node:fs';
 
-const FIXED_CREATED = 1767225600;
-const PROTOCOL_VERSION = 1;
-const MAX_BODY_BYTES = 4 * 1024 * 1024;
-const PROVIDER_TIMEOUT_MS = 15000;
-const WORK_POLL_MS = 100;
-const REGISTER_ATTEMPTS = 50;
-const REGISTER_RETRY_MS = 200;
-const STREAM_PIECE_CHARS = 64;
-// Hazard weight for weight-1 requests: rating points traded per unit of
-// next-call hazard. Validated offline on 958 fresh generator draws.
-const HAZARD_WEIGHT = 300;
+/* ------------------------------------------------------------------ */
+/* Small JSON helpers                                                  */
+/* ------------------------------------------------------------------ */
 
-type Wire = "openai" | "anthropic" | "gemini";
-type ClientApi = "openai" | "anthropic";
+/** Any JSON object: the one shape every parser in this file returns. */
+type JsonObj = Record<string, unknown>;
 
-type ProviderDir = {
+/** True when the value is a JSON object (not null, not an array). */
+function isObj(value: unknown): value is JsonObj {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** The value as a record, or an empty record when it is anything else. */
+function asObj(value: unknown): JsonObj {
+  return isObj(value) ? value : {};
+}
+
+/** A string field, or the fallback when the field is missing or not a string. */
+function strField(host: JsonObj, key: string, fallback = ''): string {
+  const found = host[key];
+  return typeof found === 'string' ? found : fallback;
+}
+
+/** A finite number field, or null when the field is missing or not a number. */
+function numField(host: JsonObj, key: string): number | null {
+  const found = host[key];
+  return typeof found === 'number' && Number.isFinite(found) ? found : null;
+}
+
+/** A boolean field, or null when the field is missing or not a boolean. */
+function boolField(host: JsonObj, key: string): boolean | null {
+  const found = host[key];
+  return typeof found === 'boolean' ? found : null;
+}
+
+/** An array field, or an empty array when the field is missing or not an array. */
+function arrField(host: JsonObj, key: string): unknown[] {
+  const found = host[key];
+  return Array.isArray(found) ? found : [];
+}
+
+/** The text carried by a string or by the text blocks of a block array, joined with newlines. */
+function blocksText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const pieces: string[] = [];
+  for (const block of content) {
+    if (isObj(block) && block.type === 'text' && typeof block.text === 'string') pieces.push(block.text);
+  }
+  return pieces.join('\n');
+}
+
+/** A stop value as a list: a lone string becomes one entry, an array keeps its strings. */
+function stopsOf(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === 'string');
+}
+
+/** Clamp a number into a closed interval. */
+function clampTo(value: number, low: number, high: number): number {
+  if (value < low) return low;
+  if (value > high) return high;
+  return value;
+}
+
+/* ------------------------------------------------------------------ */
+/* The brief: three schema-tagged documents inside prose               */
+/* ------------------------------------------------------------------ */
+
+type WireKind = 'openai' | 'anthropic' | 'gemini';
+type AuthKind = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
+
+/** One provider as the directory lists it. `base` is a path (or an absolute URL). */
+interface DirectoryProvider {
   id: string;
   name: string;
-  wire: Wire;
-  auth: string;
+  wire: WireKind;
+  auth: AuthKind;
+  base: string;
   keyEnv: string;
   key: string;
-  path: string;
-};
+}
 
-type RatingRow = {
+/** One row of the quality table: the sealed truth about a model, where a row exists. */
+interface QualityRow {
   model: string;
   provider: string;
   rating: number;
-  contextLength: number;
+  context: number | null;
   tools: boolean;
   vision: boolean;
   json: boolean;
   free: boolean;
-};
+}
 
-type Requirements = {
+/** What one request needs from the model that serves it. */
+interface Needs {
   tools?: boolean;
   vision?: boolean;
   json?: boolean;
   minContext?: number;
-};
+}
 
-type ManifestEntry = {
+/** One row of the workload manifest: the requests arrive in this order. */
+interface ManifestRow {
   id: string;
-  api: ClientApi;
+  api: 'openai' | 'anthropic';
   stream: boolean;
-  weight: number;
-  requires: Requirements;
-};
+  weight: 1 | 2;
+  requires: Needs;
+}
 
-type Brief = {
-  providers: ProviderDir[];
-  ratings: RatingRow[];
-  manifest: ManifestEntry[];
-};
+/** The brief, parsed. `problem` is set only when the brief could not be read at all. */
+interface BriefData {
+  providers: DirectoryProvider[];
+  ratings: QualityRow[];
+  manifest: ManifestRow[];
+  problem: string | null;
+}
 
-type CatalogModel = { id: string; free: boolean; context_length: number };
-type CatalogProvider = {
+const DIRECTORY_SCHEMA = 'free-model-aggregator-01/providers/v1';
+const QUALITY_SCHEMA = 'free-model-aggregator-01/ratings/v1';
+const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
+
+/**
+ * The index of the brace closing the object that opens at `open`, or -1. String
+ * contents are skipped, including escaped quotes, so braces inside strings never
+ * disturb the depth count.
+ */
+function closingBrace(text: string, open: number): number {
+  let depth = 0;
+  let quoted = false;
+  for (let at = open; at < text.length; at += 1) {
+    const ch = text[at];
+    if (quoted) {
+      if (ch === '\\') at += 1;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return at;
+    }
+  }
+  return -1;
+}
+
+/** Every top-level JSON object in the text that carries a string `schema`, in order. */
+function schemaDocuments(text: string): JsonObj[] {
+  const found: JsonObj[] = [];
+  let scan = text.indexOf('{');
+  while (scan !== -1) {
+    const end = closingBrace(text, scan);
+    if (end !== -1) {
+      try {
+        const parsed: unknown = JSON.parse(text.slice(scan, end + 1));
+        if (isObj(parsed) && typeof parsed.schema === 'string') found.push(parsed);
+      } catch {
+        // Not a document on its own; the scan moves on to the next brace.
+      }
+    }
+    scan = text.indexOf('{', scan + 1);
+  }
+  return found;
+}
+
+function wireKindOf(value: unknown): WireKind | null {
+  return value === 'openai' || value === 'anthropic' || value === 'gemini' ? value : null;
+}
+
+function authKindOf(value: unknown): AuthKind {
+  if (value === 'x-api-key' || value === 'x-goog-api-key' || value === 'none') return value;
+  return 'bearer';
+}
+
+/** One directory row, or null when the row names no usable provider. */
+function directoryRowOf(value: unknown): DirectoryProvider | null {
+  if (!isObj(value)) return null;
+  const id = strField(value, 'id');
+  const wire = wireKindOf(value.wire);
+  if (id === '' || wire === null) return null;
+  // The directory writes `path` first; an absolute base may hide under the other names.
+  const base =
+    strField(value, 'path') !== ''
+      ? strField(value, 'path')
+      : strField(value, 'base_path') !== ''
+        ? strField(value, 'base_path')
+        : strField(value, 'base_url') !== ''
+          ? strField(value, 'base_url')
+          : strField(value, 'base');
+  const name = strField(value, 'name');
+  return {
+    id,
+    name: name !== '' ? name : id,
+    wire,
+    auth: authKindOf(value.auth),
+    base,
+    keyEnv: strField(value, 'key_env'),
+    key: strField(value, 'key'),
+  };
+}
+
+/** One quality-table row, or null when the row names no model. */
+function qualityRowOf(value: unknown): QualityRow | null {
+  if (!isObj(value)) return null;
+  const model = strField(value, 'model');
+  const provider = strField(value, 'provider');
+  if (model === '' || provider === '') return null;
+  return {
+    model,
+    provider,
+    rating: numField(value, 'rating_milli') ?? 0,
+    context: numField(value, 'context_length'),
+    tools: value.tools === true,
+    vision: value.vision === true,
+    json: value.json === true,
+    free: value.free === true,
+  };
+}
+
+/** One manifest row, or null when the row names no request. */
+function manifestRowOf(value: unknown): ManifestRow | null {
+  if (!isObj(value)) return null;
+  const id = strField(value, 'id');
+  if (id === '') return null;
+  const requires = asObj(value.requires);
+  const needs: Needs = {
+    tools: requires.tools === true,
+    vision: requires.vision === true,
+    json: requires.json === true,
+  };
+  const minContext = numField(requires, 'min_context');
+  if (minContext !== null) needs.minContext = minContext;
+  return {
+    id,
+    api: value.api === 'anthropic' ? 'anthropic' : 'openai',
+    stream: value.stream === true,
+    weight: value.weight === 2 ? 2 : 1,
+    requires: needs,
+  };
+}
+
+/** Read the brief file and pull its three documents out of the surrounding prose. */
+function parseBrief(path: string): BriefData {
+  const empty: BriefData = { providers: [], ratings: [], manifest: [], problem: null };
+  if (path === '') return { ...empty, problem: 'MAKEFUN_PROMPT_FILE is not set' };
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    return { ...empty, problem: `cannot read ${path}: ${(err as Error).message}` };
+  }
+  const docs = schemaDocuments(text);
+  const directoryDoc = docs.find((doc) => doc.schema === DIRECTORY_SCHEMA && Array.isArray(doc.providers));
+  if (directoryDoc === undefined) {
+    return { ...empty, problem: `the brief at ${path} holds no ${DIRECTORY_SCHEMA} document` };
+  }
+  const providers: DirectoryProvider[] = [];
+  for (const raw of arrField(directoryDoc, 'providers')) {
+    const row = directoryRowOf(raw);
+    if (row !== null) providers.push(row);
+  }
+  const ratings: QualityRow[] = [];
+  const qualityDoc = docs.find((doc) => doc.schema === QUALITY_SCHEMA && Array.isArray(doc.ratings));
+  if (qualityDoc !== undefined) {
+    for (const raw of arrField(qualityDoc, 'ratings')) {
+      const row = qualityRowOf(raw);
+      if (row !== null) ratings.push(row);
+    }
+  }
+  const manifest: ManifestRow[] = [];
+  const workloadDoc = docs.find((doc) => doc.schema === WORKLOAD_SCHEMA && Array.isArray(doc.manifest));
+  if (workloadDoc !== undefined) {
+    for (const raw of arrField(workloadDoc, 'manifest')) {
+      const row = manifestRowOf(raw);
+      if (row !== null) manifest.push(row);
+    }
+  }
+  return { providers, ratings, manifest, problem: null };
+}
+
+/* ------------------------------------------------------------------ */
+/* The fleet: probing catalog routes and assembling the catalog        */
+/* ------------------------------------------------------------------ */
+
+/** One model as a provider's own catalog route listed it. Nulls mean "unsaid". */
+interface ListedModel {
+  id: string;
+  displayName: string;
+  free: boolean | null;
+  context: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+/** What one provider's catalog probe learned. A failed probe carries no models. */
+interface ProbeOutcome {
+  provider: DirectoryProvider;
+  ok: boolean;
+  status: number;
+  models: ListedModel[];
+  problem: string | null;
+}
+
+/** One catalog entry, as `--list` prints it and the register body carries it. */
+interface CatalogEntry {
   id: string;
   base_url: string;
   key_env: string;
-  wire: Wire;
-  models: CatalogModel[];
-};
-type Catalog = { providers: CatalogProvider[] };
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v);
+  wire: WireKind;
+  models: { id: string; free: boolean; context_length: number | null }[];
 }
 
-function asNumber(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+/** Join a directory base to the env URL; an absolute base stands on its own. */
+function joinToEnv(envUrl: string, base: string): string {
+  const trimmed = base.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/+$/, '');
+  const root = envUrl.replace(/\/+$/, '');
+  if (trimmed === '') return root;
+  return `${root}${trimmed.startsWith('/') ? '' : '/'}${trimmed.replace(/\/+$/, '')}`;
 }
 
-function asStringList(v: unknown): string[] {
-  if (typeof v === "string") return [v];
-  if (!Array.isArray(v)) return [];
-  return v.filter((x): x is string => typeof x === "string");
+/** The headers that carry a provider's key, under its own auth scheme. */
+function headersForKey(auth: AuthKind, key: string): Record<string, string> {
+  if (key === '') return {};
+  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
+  if (auth === 'x-api-key') return { 'x-api-key': key };
+  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
+  return {};
 }
 
-// The text a wire's parser reads from a content value: a string as-is, or
-// the text blocks of an array joined with newlines.
-function blocksText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") {
-      parts.push(block.text);
-    }
+/**
+ * Whether a listing's pricing object prices the model at zero: true when every
+ * price it names is zero, null when it names no prices at all, false otherwise.
+ */
+function freeFromPricing(entry: JsonObj): boolean | null {
+  const pricing = asObj(entry.pricing);
+  if (!isObj(entry.pricing)) return null;
+  const amounts: number[] = [];
+  for (const value of Object.values(pricing)) {
+    if (typeof value === 'number') amounts.push(value);
+    else if (typeof value === 'string' && value.trim() !== '') amounts.push(Number(value));
   }
-  return parts.join("\n");
+  if (amounts.length === 0) return null;
+  return amounts.every((amount) => Number.isFinite(amount) && amount === 0);
 }
 
-function clone<T>(v: T): T {
-  if (v === undefined) return v;
-  return structuredClone(v);
+/** One model as a listing wrote it, in whichever wire's spelling, or null. */
+function listingModelOf(wire: WireKind, value: unknown): ListedModel | null {
+  if (!isObj(value)) return null;
+  const rawId = wire === 'gemini' ? strField(value, 'name').replace(/^models\//, '') : strField(value, 'id');
+  if (rawId === '') return null;
+  const display =
+    strField(value, 'display_name') !== ''
+      ? strField(value, 'display_name')
+      : strField(value, 'displayName') !== ''
+        ? strField(value, 'displayName')
+        : rawId;
+  const context = numField(value, 'context_length') ?? numField(value, 'context_window') ?? numField(value, 'inputTokenLimit');
+  return {
+    id: rawId,
+    displayName: display,
+    free: boolField(value, 'free') ?? freeFromPricing(value),
+    context,
+    tools: boolField(value, 'tools'),
+    vision: boolField(value, 'vision'),
+    json: boolField(value, 'json'),
+  };
 }
 
-// Scan text for top-level JSON objects and return the parsed ones. The brief
-// carries three documents (providers, ratings, workload), each tagged with
-// a schema; prose around them is ignored.
-function jsonDocuments(text: string): Record<string, unknown>[] {
-  const docs: Record<string, unknown>[] = [];
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] !== "{") {
-      i += 1;
-      continue;
-    }
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    let j = i;
-    let closed = -1;
-    while (j < text.length) {
-      const ch = text[j];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === "\\") escaped = true;
-        else if (ch === '"') inString = false;
-      } else if (ch === '"') {
-        inString = true;
-      } else if (ch === "{") {
-        depth += 1;
-      } else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          closed = j;
-          break;
-        }
-      }
-      j += 1;
-    }
-    if (closed === -1) break;
-    try {
-      const parsed: unknown = JSON.parse(text.slice(i, closed + 1));
-      if (isRecord(parsed) && typeof parsed.schema === "string") {
-        docs.push(parsed);
-        i = closed + 1;
-        continue;
-      }
-    } catch {
-      // Not a standalone document; keep scanning from the next character.
-    }
-    i += 1;
+/** The models one catalog answer listed, in its wire's shape. */
+function listingModelsOf(wire: WireKind, body: unknown): ListedModel[] {
+  if (!isObj(body)) return [];
+  const list = wire === 'gemini' ? body.models : body.data;
+  if (!Array.isArray(list)) return [];
+  const models: ListedModel[] = [];
+  for (const raw of list) {
+    const model = listingModelOf(wire, raw);
+    if (model !== null) models.push(model);
   }
-  return docs;
+  return models;
 }
 
-function wireOf(v: unknown): Wire | null {
-  return v === "openai" || v === "anthropic" || v === "gemini" ? v : null;
-}
+const PROBE_BUDGET_MS = 5000;
 
-function parseBrief(text: string): Brief {
-  const brief: Brief = { providers: [], ratings: [], manifest: [] };
-  for (const doc of jsonDocuments(text)) {
-    const schema = doc.schema as string;
-    if (schema.endsWith("/providers/v1") && Array.isArray(doc.providers)) {
-      for (const raw of doc.providers) {
-        if (!isRecord(raw)) continue;
-        const wire = wireOf(raw.wire);
-        if (typeof raw.id !== "string" || raw.id === "" || wire === null) continue;
-        if (typeof raw.path !== "string" || raw.path === "") continue;
-        brief.providers.push({
-          id: raw.id,
-          name: typeof raw.name === "string" ? raw.name : raw.id,
-          wire,
-          auth: typeof raw.auth === "string" ? raw.auth : "none",
-          keyEnv: typeof raw.key_env === "string" ? raw.key_env : "",
-          key: typeof raw.key === "string" ? raw.key : "",
-          path: raw.path,
-        });
-      }
-    } else if (schema.endsWith("/ratings/v1") && Array.isArray(doc.ratings)) {
-      for (const raw of doc.ratings) {
-        if (!isRecord(raw)) continue;
-        if (typeof raw.model !== "string" || typeof raw.provider !== "string") continue;
-        const rating = asNumber(raw.rating_milli);
-        const contextLength = asNumber(raw.context_length);
-        if (rating === null || contextLength === null) continue;
-        brief.ratings.push({
-          model: raw.model,
-          provider: raw.provider,
-          rating,
-          contextLength,
-          tools: raw.tools === true,
-          vision: raw.vision === true,
-          json: raw.json === true,
-          free: raw.free === true,
-        });
-      }
-    } else if (schema.endsWith("/workload/v1") && Array.isArray(doc.manifest)) {
-      for (const raw of doc.manifest) {
-        if (!isRecord(raw)) continue;
-        if (typeof raw.id !== "string") continue;
-        if (raw.api !== "openai" && raw.api !== "anthropic") continue;
-        const requires: Requirements = {};
-        if (isRecord(raw.requires)) {
-          if (raw.requires.tools === true) requires.tools = true;
-          if (raw.requires.vision === true) requires.vision = true;
-          if (raw.requires.json === true) requires.json = true;
-          const minContext = asNumber(raw.requires.min_context);
-          if (minContext !== null) requires.minContext = minContext;
-        }
-        brief.manifest.push({
-          id: raw.id,
-          api: raw.api,
-          stream: raw.stream === true,
-          weight: asNumber(raw.weight) ?? 1,
-          requires,
-        });
-      }
-    }
-  }
-  return brief;
-}
-
-function readBrief(): Brief {
-  const empty: Brief = { providers: [], ratings: [], manifest: [] };
-  const file = process.env.MAKEFUN_PROMPT_FILE;
-  if (!file) return empty;
+/**
+ * Probe one provider's catalog route in its own wire. Any failure — refused
+ * connection, non-2xx, a body that is not JSON — leaves the provider out of the
+ * catalog and off the routing table; the trial goes on without it.
+ */
+async function probeOne(envUrl: string, provider: DirectoryProvider): Promise<ProbeOutcome> {
+  const root = joinToEnv(envUrl, provider.base);
+  const target = provider.wire === 'gemini' ? `${root}/v1beta/models` : `${root}/v1/models`;
+  const headers: Record<string, string> = { accept: 'application/json', ...headersForKey(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+  const failed = (status: number, problem: string): ProbeOutcome => ({ provider, ok: false, status, models: [], problem });
   try {
-    return parseBrief(readFileSync(file, "utf8"));
+    const res = await fetch(target, { headers, signal: AbortSignal.timeout(PROBE_BUDGET_MS) });
+    if (!res.ok) return failed(res.status, `GET ${target} answered HTTP ${res.status}`);
+    const body: unknown = await res.json();
+    return { provider, ok: true, status: res.status, models: listingModelsOf(provider.wire, body), problem: null };
   } catch (err) {
-    process.stderr.write(`aggregator: cannot read brief: ${(err as Error).message}\n`);
-    return empty;
+    return failed(0, `GET ${target} failed: ${(err as Error).message}`);
   }
 }
 
-// The catalog lists every provider from the brief with exactly its free
-// models, in the brief's own order. One object is built once and used for
-// both --list and register, so the two are byte-identical by construction.
-function buildCatalog(brief: Brief): Catalog {
-  const providers: CatalogProvider[] = [];
-  for (const p of brief.providers) {
+/** The quality-table row for one provider's model, when the table has one. */
+function qualityLookup(ratings: QualityRow[], providerId: string, modelId: string): QualityRow | null {
+  return ratings.find((row) => row.provider === providerId && row.model === modelId) ?? null;
+}
+
+/**
+ * Whether a model is free: the quality table's row where one exists (it is the
+ * sealed truth), the listing's own word where it does not, paid when neither says.
+ */
+function freeStanding(model: ListedModel, row: QualityRow | null): boolean {
+  if (row !== null) return row.free;
+  return model.free ?? false;
+}
+
+/** What a model can do: the quality table's row first, the listing's fields second. */
+interface ModelCaps {
+  context: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+function capsStanding(model: ListedModel, row: QualityRow | null): ModelCaps {
+  return {
+    context: row?.context ?? model.context ?? null,
+    tools: row?.tools ?? model.tools ?? null,
+    vision: row?.vision ?? model.vision ?? null,
+    json: row?.json ?? model.json ?? null,
+  };
+}
+
+/** Whether a model's capabilities meet one request's requirements. Unknown never meets. */
+function capsMeet(needs: Needs, caps: ModelCaps): boolean {
+  if (needs.tools === true && caps.tools !== true) return false;
+  if (needs.vision === true && caps.vision !== true) return false;
+  if (needs.json === true && caps.json !== true) return false;
+  if (needs.minContext !== undefined && (caps.context === null || caps.context < needs.minContext)) return false;
+  return true;
+}
+
+function byModelId(a: ListedModel, b: ListedModel): number {
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * The one catalog: every provider that answered, in the brief's order, each with
+ * its models sorted by id and deduplicated. The base_url stays the directory's own
+ * path, never joined to the env URL — the env's origin differs between a live pass
+ * and its replay, and the catalog is part of the state a replay must reproduce.
+ */
+function assembleCatalog(probes: readonly ProbeOutcome[], ratings: QualityRow[]): { providers: CatalogEntry[] } {
+  const entries: CatalogEntry[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
     const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const row of brief.ratings) {
-      if (row.provider !== p.id || !row.free) continue;
-      if (seen.has(row.model)) continue;
-      seen.add(row.model);
-      models.push({ id: row.model, free: true, context_length: row.contextLength });
+    const models: CatalogEntry['models'] = [];
+    for (const model of [...probe.models].sort(byModelId)) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      const row = qualityLookup(ratings, probe.provider.id, model.id);
+      models.push({
+        id: model.id,
+        free: freeStanding(model, row),
+        context_length: row?.context ?? model.context ?? null,
+      });
     }
-    providers.push({
-      id: p.id,
-      base_url: p.path,
-      key_env: p.keyEnv,
-      wire: p.wire,
+    entries.push({
+      id: probe.provider.id,
+      base_url: probe.provider.base,
+      key_env: probe.provider.keyEnv,
+      wire: probe.provider.wire,
       models,
     });
   }
-  return { providers };
+  return { providers: entries };
 }
 
-// ---------------------------------------------------------------------------
-// Request normalization: both client wires collapse into one shape that
-// preserves exactly what the providers echo back: the system text, the user
-// text, the tool names in order, max_tokens, the stop list, the last image,
-// and JSON mode. Nothing is rewritten or defaulted.
-// ---------------------------------------------------------------------------
-
-type ImageRef =
-  | { kind: "data"; mime: string; data: string }
-  | { kind: "url"; url: string };
-
-type ToolCall = { id: string; name: string; argsText: string };
-type ToolResult = { id: string; name: string; text: string };
-
-type NormMessage = {
-  role: "user" | "assistant" | "tool";
-  text: string;
-  images: ImageRef[];
-  toolCalls: ToolCall[];
-  toolResults: ToolResult[];
-};
-
-type ToolDef = {
-  name: string;
-  description?: string;
-  parameters?: unknown;
-};
-
-type NormRequest = {
-  api: ClientApi;
-  stream: boolean;
-  systemText: string;
-  messages: NormMessage[];
-  tools: ToolDef[];
-  toolChoice: unknown;
-  maxTokens: number | null;
-  temperature: number | null;
-  topP: number | null;
-  stops: string[];
-  jsonMode: boolean;
-  responseFormat: unknown;
-  anthropicVersion: string | null;
-  toolNameById: Map<string, string>;
-};
-
-// Split an image reference the way the providers hash it: a base64 data URL
-// hashes its decoded bytes, anything else hashes the URL string itself.
-function parseImageRef(url: unknown): ImageRef | null {
-  if (typeof url !== "string" || url === "") return null;
-  const at = url.indexOf(";base64,");
-  if (url.startsWith("data:") && at !== -1) {
-    const header = url.slice("data:".length, at);
-    const mime = header.split(";")[0] || "image/png";
-    return { kind: "data", mime, data: url.slice(at + ";base64,".length) };
-  }
-  return { kind: "url", url };
+/** One model the entry serves, as GET /v1/models lists it. */
+interface ServedModel {
+  id: string;
+  provider: string;
+  displayName: string;
 }
 
-function imageDataUrl(img: ImageRef): string {
-  return img.kind === "data" ? `data:${img.mime};base64,${img.data}` : img.url;
-}
-
-function collectOpenAIMessage(raw: Record<string, unknown>): NormMessage | null {
-  const role = raw.role;
-  if (role !== "user" && role !== "assistant" && role !== "tool") return null;
-  const msg: NormMessage = { role, text: "", images: [], toolCalls: [], toolResults: [] };
-  const content = raw.content;
-  msg.text = blocksText(content);
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === "image_url" && isRecord(block.image_url)) {
-        const img = parseImageRef(block.image_url.url);
-        if (img) msg.images.push(img);
-      }
+/** The free models across the providers that answered, in the brief's provider order. */
+function servedList(probes: readonly ProbeOutcome[], ratings: QualityRow[]): ServedModel[] {
+  const out: ServedModel[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    for (const model of [...probe.models].sort(byModelId)) {
+      const row = qualityLookup(ratings, probe.provider.id, model.id);
+      if (!freeStanding(model, row)) continue;
+      out.push({ id: model.id, provider: probe.provider.id, displayName: model.displayName });
     }
   }
-  if (Array.isArray(raw.tool_calls)) {
-    for (const call of raw.tool_calls) {
-      if (!isRecord(call) || !isRecord(call.function)) continue;
-      const name = call.function.name;
-      if (typeof name !== "string") continue;
-      const args = call.function.arguments;
-      msg.toolCalls.push({
-        id: typeof call.id === "string" ? call.id : "",
-        name,
-        argsText: typeof args === "string" ? args : JSON.stringify(args ?? {}),
-      });
-    }
-  }
-  if (role === "tool") {
-    msg.toolResults.push({
-      id: typeof raw.tool_call_id === "string" ? raw.tool_call_id : "",
-      name: "",
-      text: msg.text,
-    });
-    msg.text = "";
-  }
-  return msg;
-}
-
-function resolveToolNames(messages: NormMessage[], toolNameById: Map<string, string>): void {
-  for (const msg of messages) {
-    for (const call of msg.toolCalls) {
-      if (call.id !== "") toolNameById.set(call.id, call.name);
-    }
-  }
-  for (const msg of messages) {
-    for (const res of msg.toolResults) {
-      res.name = toolNameById.get(res.id) ?? res.id;
-    }
-  }
-}
-
-function parseOpenAIRequest(body: Record<string, unknown>, _headers: IncomingMessage["headers"]): NormRequest {
-  const systemParts: string[] = [];
-  const messages: NormMessage[] = [];
-  const toolNameById = new Map<string, string>();
-  const rawMessages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
-  for (const raw of rawMessages) {
-    if (raw.role === "system") {
-      const text = blocksText(raw.content);
-      if (text !== "") systemParts.push(text);
-      continue;
-    }
-    const msg = collectOpenAIMessage(raw);
-    if (msg) messages.push(msg);
-  }
-  resolveToolNames(messages, toolNameById);
-  const tools: ToolDef[] = [];
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isRecord(tool) || !isRecord(tool.function)) continue;
-      const name = tool.function.name;
-      if (typeof name !== "string") continue;
-      const def: ToolDef = { name };
-      if (typeof tool.function.description === "string") def.description = tool.function.description;
-      if (tool.function.parameters !== undefined) def.parameters = clone(tool.function.parameters);
-      tools.push(def);
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return {
-    api: "openai",
-    stream: body.stream === true,
-    systemText: systemParts.join("\n"),
-    messages,
-    tools,
-    toolChoice: body.tool_choice,
-    maxTokens: asNumber(body.max_tokens) ?? asNumber(body.max_completion_tokens),
-    temperature: asNumber(body.temperature),
-    topP: asNumber(body.top_p),
-    stops: asStringList(body.stop),
-    jsonMode: format === "json_object" || format === "json_schema",
-    responseFormat: body.response_format,
-    anthropicVersion: null,
-    toolNameById,
-  };
-}
-
-function collectAnthropicMessage(raw: Record<string, unknown>): NormMessage | null {
-  const role = raw.role;
-  if (role !== "user" && role !== "assistant") return null;
-  const msg: NormMessage = { role, text: "", images: [], toolCalls: [], toolResults: [] };
-  const content = raw.content;
-  msg.text = blocksText(content);
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (!isRecord(block)) continue;
-      if (block.type === "image" && isRecord(block.source)) {
-        if (block.source.type === "base64" && typeof block.source.data === "string") {
-          msg.images.push({
-            kind: "data",
-            mime: typeof block.source.media_type === "string" ? block.source.media_type : "image/png",
-            data: block.source.data,
-          });
-        } else if (block.source.type === "url") {
-          const img = parseImageRef(block.source.url);
-          if (img) msg.images.push(img);
-        }
-      } else if (block.type === "tool_use") {
-        if (typeof block.name !== "string") continue;
-        msg.toolCalls.push({
-          id: typeof block.id === "string" ? block.id : "",
-          name: block.name,
-          argsText: JSON.stringify(block.input ?? {}),
-        });
-      } else if (block.type === "tool_result") {
-        const text = typeof block.content === "string" ? block.content : blocksText(block.content);
-        msg.toolResults.push({
-          id: typeof block.tool_use_id === "string" ? block.tool_use_id : "",
-          name: "",
-          text,
-        });
-      }
-    }
-  }
-  return msg;
-}
-
-function parseAnthropicRequest(body: Record<string, unknown>, headers: IncomingMessage["headers"]): NormRequest {
-  const messages: NormMessage[] = [];
-  const toolNameById = new Map<string, string>();
-  const rawMessages = Array.isArray(body.messages) ? body.messages.filter(isRecord) : [];
-  for (const raw of rawMessages) {
-    const msg = collectAnthropicMessage(raw);
-    if (msg) messages.push(msg);
-  }
-  resolveToolNames(messages, toolNameById);
-  const tools: ToolDef[] = [];
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isRecord(tool) || typeof tool.name !== "string") continue;
-      const def: ToolDef = { name: tool.name };
-      if (typeof tool.description === "string") def.description = tool.description;
-      if (tool.input_schema !== undefined) def.parameters = clone(tool.input_schema);
-      tools.push(def);
-    }
-  }
-  const version = headers["anthropic-version"];
-  return {
-    api: "anthropic",
-    stream: body.stream === true,
-    systemText: blocksText(body.system),
-    messages,
-    tools,
-    toolChoice: body.tool_choice,
-    maxTokens: asNumber(body.max_tokens),
-    temperature: asNumber(body.temperature),
-    topP: asNumber(body.top_p),
-    stops: asStringList(body.stop_sequences),
-    jsonMode: false,
-    responseFormat: undefined,
-    anthropicVersion: typeof version === "string" ? version : null,
-    toolNameById,
-  };
-}
-
-// Requirements inferred from the body itself, unioned with the manifest's:
-// tools present, an image present, or JSON mode requested.
-function bodyRequirements(req: NormRequest): Requirements {
-  const out: Requirements = {};
-  if (req.tools.length > 0) out.tools = true;
-  if (req.messages.some((m) => m.images.length > 0)) out.vision = true;
-  if (req.jsonMode) out.json = true;
   return out;
 }
 
-function lastUserText(req: NormRequest): string {
-  for (let i = req.messages.length - 1; i >= 0; i--) {
-    if (req.messages[i].role === "user") return req.messages[i].text;
-  }
-  return "";
+/* ------------------------------------------------------------------ */
+/* The canonical request: one shape for both client wires              */
+/*                                                                     */
+/* The provider echoes exactly what it parsed — system text, user      */
+/* text, tool names, max tokens, stops, the image, JSON mode — and     */
+/* the client compares that echo with what it sent. The canonical      */
+/* shape therefore keeps every echo-bearing field verbatim, in order,  */
+/* and every renderer below is written against the provider parsers'   */
+/* own rules: which message a parser reads last, which roles it        */
+/* ignores, which content kinds carry text.                            */
+/* ------------------------------------------------------------------ */
+
+/** An image, either inline base64 data or a remote URL. */
+interface ImageRef {
+  mode: 'data' | 'url';
+  media: string;
+  data: string;
+  url: string;
 }
 
-// ---------------------------------------------------------------------------
-// Target builders: the normalized request rendered in each provider wire.
-// Every echoed field is carried exactly; absent stays absent (notably
-// max_tokens, which is never invented).
-// ---------------------------------------------------------------------------
-
-function openAIToolChoice(choice: unknown): unknown {
-  if (choice === undefined) return undefined;
-  if (typeof choice === "string") return choice;
-  if (isRecord(choice) && choice.type === "tool" && typeof choice.name === "string") {
-    return { type: "function", function: { name: choice.name } };
-  }
-  if (isRecord(choice) && choice.type === "any") return "required";
-  if (isRecord(choice) && choice.type === "auto") return "auto";
-  if (isRecord(choice) && choice.type === "none") return "none";
-  return clone(choice);
+/** One assistant tool call: the id, the function name, the arguments as JSON text. */
+interface CallStep {
+  id: string;
+  name: string;
+  args: string;
 }
 
-function anthropicToolChoice(choice: unknown): unknown {
-  if (choice === undefined) return undefined;
-  if (choice === "auto") return { type: "auto" };
-  if (choice === "required") return { type: "any" };
-  if (choice === "none") return { type: "none" };
-  if (isRecord(choice) && choice.type === "function" && isRecord(choice.function) && typeof choice.function.name === "string") {
-    return { type: "tool", name: choice.function.name };
-  }
-  return clone(choice);
+/** One tool result: the call it answers and its content as text. */
+interface ResultStep {
+  id: string;
+  text: string;
 }
 
-function geminiToolConfig(choice: unknown, tools: ToolDef[]): Record<string, unknown> | null {
-  if (choice === undefined || tools.length === 0) return null;
-  if (choice === "none") return { functionCallingConfig: { mode: "NONE" } };
-  if (choice === "required") return { functionCallingConfig: { mode: "ANY" } };
-  if (isRecord(choice) && choice.type === "function" && isRecord(choice.function) && typeof choice.function.name === "string") {
-    return { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [choice.function.name] } };
-  }
-  if (isRecord(choice) && choice.type === "tool" && typeof choice.name === "string") {
-    return { functionCallingConfig: { mode: "ANY", allowedFunctionNames: [choice.name] } };
-  }
-  if (isRecord(choice) && choice.type === "any") return { functionCallingConfig: { mode: "ANY" } };
-  if (isRecord(choice) && choice.type === "none") return { functionCallingConfig: { mode: "NONE" } };
-  return { functionCallingConfig: { mode: "AUTO" } };
+/** One segment of a user turn: prose, an image, or a tool result. */
+type TurnSegment =
+  | { kind: 'text'; text: string }
+  | { kind: 'image'; image: ImageRef }
+  | { kind: 'result'; result: ResultStep };
+
+/** One conversation turn. User turns carry segments; assistant turns carry prose and calls. */
+interface Turn {
+  role: 'user' | 'assistant' | 'tool';
+  segments: TurnSegment[];
+  prose: string;
+  calls: CallStep[];
+  toolId: string;
+  toolText: string;
 }
 
-function buildOpenAIBody(req: NormRequest, model: string): Record<string, unknown> {
-  const messages: Record<string, unknown>[] = [];
-  if (req.systemText !== "") {
-    messages.push({ role: "system", content: req.systemText });
+/** One tool definition: the name the echo compares, plus its contract. */
+interface ToolDef {
+  name: string;
+  description: string;
+  schema: JsonObj;
+}
+
+type ChoiceKind = 'auto' | 'required' | { name: string } | null;
+
+/** A client request, normalised. `jsonMode` is true only on the OpenAI wire. */
+interface CanonRequest {
+  system: string;
+  turns: Turn[];
+  tools: ToolDef[];
+  choice: ChoiceKind;
+  stops: string[];
+  maxTokens: number | null;
+  temperature: number | null;
+  jsonMode: boolean;
+  jsonType: string;
+  stream: boolean;
+  clientModel: string;
+}
+
+function blankTurn(role: Turn['role']): Turn {
+  return { role, segments: [], prose: '', calls: [], toolId: '', toolText: '' };
+}
+
+/** The prose of a user turn: its text segments joined with newlines, in order. */
+function turnProse(turn: Turn): string {
+  const pieces: string[] = [];
+  for (const segment of turn.segments) {
+    if (segment.kind === 'text') pieces.push(segment.text);
   }
-  for (const msg of req.messages) {
-    if (msg.role === "tool") {
-      for (const res of msg.toolResults) {
-        messages.push({ role: "tool", tool_call_id: res.id, content: res.text });
-      }
+  return pieces.join('\n');
+}
+
+/** A data URL split into its media type and base64 payload, or null when it is not one. */
+function dataUrlOf(url: string): { media: string; data: string } | null {
+  const match = /^data:([^,]*);base64,(.*)$/s.exec(url);
+  if (match === null) return null;
+  return { media: match[1] !== '' ? match[1] : 'image/png', data: match[2] };
+}
+
+/** An OpenAI image_url part as an image reference. */
+function imageFromUrl(url: string): ImageRef {
+  const data = dataUrlOf(url);
+  if (data !== null) return { mode: 'data', media: data.media, data: data.data, url: '' };
+  return { mode: 'url', media: '', data: '', url };
+}
+
+/** A tool result's content as text: its text blocks, or its JSON when it holds something else. */
+function resultTextOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const text = blocksText(content);
+    return text !== '' ? text : JSON.stringify(content);
+  }
+  return content === undefined ? '' : JSON.stringify(content);
+}
+
+/** An OpenAI Chat Completions body as a canonical request. */
+function openAIToCanon(body: JsonObj): CanonRequest {
+  const systemPieces: string[] = [];
+  const turns: Turn[] = [];
+  for (const raw of arrField(body, 'messages')) {
+    if (!isObj(raw)) continue;
+    const role = strField(raw, 'role');
+    if (role === 'system') {
+      const text = blocksText(raw.content);
+      if (text !== '') systemPieces.push(text);
       continue;
     }
-    if (msg.role === "assistant") {
-      const out: Record<string, unknown> = { role: "assistant", content: msg.text };
-      if (msg.toolCalls.length > 0) {
-        out.tool_calls = msg.toolCalls.map((c) => ({
-          id: c.id,
-          type: "function",
-          function: { name: c.name, arguments: c.argsText },
+    if (role === 'assistant') {
+      const turn = blankTurn('assistant');
+      turn.prose = blocksText(raw.content);
+      for (const call of arrField(raw, 'tool_calls')) {
+        if (!isObj(call) || !isObj(call.function)) continue;
+        const args = call.function.arguments;
+        turn.calls.push({
+          id: strField(call, 'id'),
+          name: strField(call.function, 'name'),
+          args: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        });
+      }
+      turns.push(turn);
+      continue;
+    }
+    if (role === 'tool') {
+      const turn = blankTurn('tool');
+      turn.toolId = strField(raw, 'tool_call_id');
+      turn.toolText = typeof raw.content === 'string' ? raw.content : blocksText(raw.content);
+      turns.push(turn);
+      continue;
+    }
+    // Anything else travels as a user turn: the parsers only read user turns for prose.
+    const turn = blankTurn('user');
+    const content = raw.content;
+    if (typeof content === 'string') {
+      if (content !== '') turn.segments.push({ kind: 'text', text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isObj(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') turn.segments.push({ kind: 'text', text: block.text });
+        else if (block.type === 'image_url' && isObj(block.image_url) && typeof block.image_url.url === 'string') {
+          turn.segments.push({ kind: 'image', image: imageFromUrl(block.image_url.url) });
+        }
+      }
+    }
+    turns.push(turn);
+  }
+  const tools: ToolDef[] = [];
+  for (const raw of arrField(body, 'tools')) {
+    if (!isObj(raw) || !isObj(raw.function)) continue;
+    const name = strField(raw.function, 'name');
+    if (name === '') continue;
+    tools.push({
+      name,
+      description: strField(raw.function, 'description'),
+      schema: isObj(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+    });
+  }
+  let choice: ChoiceKind = null;
+  const asked = body.tool_choice;
+  if (asked === 'auto') choice = 'auto';
+  else if (asked === 'required') choice = 'required';
+  else if (isObj(asked) && asked.type === 'function' && isObj(asked.function) && typeof asked.function.name === 'string') {
+    choice = { name: asked.function.name };
+  }
+  const format = asObj(body.response_format);
+  const formatType = strField(format, 'type');
+  return {
+    system: systemPieces.join('\n'),
+    turns,
+    tools,
+    choice,
+    stops: stopsOf(body.stop),
+    maxTokens: numField(body, 'max_tokens') ?? numField(body, 'max_completion_tokens'),
+    temperature: numField(body, 'temperature'),
+    jsonMode: formatType === 'json_object' || formatType === 'json_schema',
+    jsonType: formatType !== '' ? formatType : 'json_object',
+    stream: body.stream === true,
+    clientModel: strField(body, 'model', 'auto'),
+  };
+}
+
+/** An Anthropic Messages body as a canonical request. */
+function anthropicToCanon(body: JsonObj): CanonRequest {
+  const turns: Turn[] = [];
+  for (const raw of arrField(body, 'messages')) {
+    if (!isObj(raw)) continue;
+    const role = strField(raw, 'role');
+    if (role === 'assistant') {
+      const turn = blankTurn('assistant');
+      const content = raw.content;
+      if (typeof content === 'string') turn.prose = content;
+      else if (Array.isArray(content)) {
+        turn.prose = blocksText(content);
+        for (const block of content) {
+          if (!isObj(block) || block.type !== 'tool_use') continue;
+          turn.calls.push({
+            id: strField(block, 'id'),
+            name: strField(block, 'name'),
+            args: JSON.stringify(isObj(block.input) ? block.input : {}),
+          });
+        }
+      }
+      turns.push(turn);
+      continue;
+    }
+    const turn = blankTurn('user');
+    const content = raw.content;
+    if (typeof content === 'string') {
+      if (content !== '') turn.segments.push({ kind: 'text', text: content });
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (!isObj(block)) continue;
+        if (block.type === 'text' && typeof block.text === 'string') {
+          turn.segments.push({ kind: 'text', text: block.text });
+        } else if (block.type === 'image' && isObj(block.source)) {
+          const source = block.source;
+          if (source.type === 'base64' && typeof source.data === 'string') {
+            turn.segments.push({
+              kind: 'image',
+              image: {
+                mode: 'data',
+                media: typeof source.media_type === 'string' ? source.media_type : 'image/png',
+                data: source.data,
+                url: '',
+              },
+            });
+          } else if (source.type === 'url' && typeof source.url === 'string') {
+            turn.segments.push({ kind: 'image', image: { mode: 'url', media: '', data: '', url: source.url } });
+          }
+        } else if (block.type === 'tool_result') {
+          turn.segments.push({
+            kind: 'result',
+            result: { id: strField(block, 'tool_use_id'), text: resultTextOf(block.content) },
+          });
+        }
+      }
+    }
+    turns.push(turn);
+  }
+  const tools: ToolDef[] = [];
+  for (const raw of arrField(body, 'tools')) {
+    if (!isObj(raw)) continue;
+    const name = strField(raw, 'name');
+    if (name === '') continue;
+    tools.push({
+      name,
+      description: strField(raw, 'description'),
+      schema: isObj(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+    });
+  }
+  let choice: ChoiceKind = null;
+  const asked = asObj(body.tool_choice);
+  if (asked.type === 'auto') choice = 'auto';
+  else if (asked.type === 'any') choice = 'required';
+  else if (asked.type === 'tool' && typeof asked.name === 'string') choice = { name: asked.name };
+  return {
+    system: blocksText(body.system),
+    turns,
+    tools,
+    choice,
+    stops: stopsOf(body.stop_sequences),
+    maxTokens: numField(body, 'max_tokens'),
+    temperature: numField(body, 'temperature'),
+    // The Anthropic wire carries no JSON-mode marker: its parser always echoes it absent.
+    jsonMode: false,
+    jsonType: 'json_object',
+    stream: body.stream === true,
+    clientModel: strField(body, 'model', 'auto'),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Rendering the canonical request into a provider's wire              */
+/*                                                                     */
+/* Each renderer honours the receiving parser's rules. The OpenAI      */
+/* parser reads the last user message's text and ignores tool roles,   */
+/* so tool results travel as their own messages. The Anthropic parser  */
+/* reads the last user message too, so a tool-only turn must never     */
+/* become a standalone user message — it is folded into the nearest    */
+/* user message instead. The Gemini parser reads the last non-model    */
+/* content, so assistant and tool turns travel as model-role contents  */
+/* that it skips. JSON mode rides response_format on the OpenAI wire   */
+/* and responseMimeType on the Gemini wire; the Anthropic wire cannot  */
+/* carry it, and the router never sends a JSON request there.          */
+/* ------------------------------------------------------------------ */
+
+/** A tool call's arguments text as an object, or {} when it is not one. */
+function argsObjectOf(args: string): JsonObj {
+  if (args.trim() === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(args);
+    return isObj(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The canonical request as an OpenAI Chat Completions body naming `model`. */
+function canonToOpenAI(ir: CanonRequest, model: string): JsonObj {
+  const messages: JsonObj[] = [];
+  if (ir.system !== '') messages.push({ role: 'system', content: ir.system });
+  for (const turn of ir.turns) {
+    if (turn.role === 'assistant') {
+      const message: JsonObj = { role: 'assistant', content: turn.prose !== '' ? turn.prose : null };
+      if (turn.calls.length > 0) {
+        message.tool_calls = turn.calls.map((call) => ({
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: call.args },
         }));
       }
-      messages.push(out);
+      messages.push(message);
       continue;
     }
-    // User message. Tool results riding on it (Anthropic input) become
-    // trailing tool messages; the user message itself keeps text + images.
-    if (msg.images.length === 0 && msg.toolResults.length === 0) {
-      messages.push({ role: "user", content: msg.text });
-    } else {
-      const parts: Record<string, unknown>[] = [];
-      if (msg.text !== "") parts.push({ type: "text", text: msg.text });
-      for (const img of msg.images) {
-        parts.push({ type: "image_url", image_url: { url: imageDataUrl(img) } });
+    if (turn.role === 'tool') {
+      messages.push({ role: 'tool', tool_call_id: turn.toolId, content: turn.toolText });
+      continue;
+    }
+    if (turn.segments.length === 0) continue;
+    // Tool results leave the turn as their own messages; the parser ignores them.
+    for (const segment of turn.segments) {
+      if (segment.kind === 'result') {
+        messages.push({ role: 'tool', tool_call_id: segment.result.id, content: segment.result.text });
       }
-      messages.push({ role: "user", content: parts });
     }
-    for (const res of msg.toolResults) {
-      messages.push({ role: "tool", tool_call_id: res.id, content: res.text });
+    const prose = turnProse(turn);
+    const images = turn.segments.filter((segment): segment is Extract<TurnSegment, { kind: 'image' }> => segment.kind === 'image');
+    if (images.length === 0) {
+      messages.push({ role: 'user', content: prose });
+      continue;
     }
+    const parts: JsonObj[] = [];
+    if (prose !== '') parts.push({ type: 'text', text: prose });
+    for (const entry of images) {
+      const image = entry.image;
+      const url = image.mode === 'data' ? `data:${image.media};base64,${image.data}` : image.url;
+      parts.push({ type: 'image_url', image_url: { url } });
+    }
+    messages.push({ role: 'user', content: parts });
   }
-  const body: Record<string, unknown> = { model, messages };
-  if (req.tools.length > 0) {
-    body.tools = req.tools.map((t) => {
-      const fn: Record<string, unknown> = { name: t.name };
-      if (t.description !== undefined) fn.description = t.description;
-      if (t.parameters !== undefined) fn.parameters = clone(t.parameters);
-      return { type: "function", function: fn };
-    });
-    const choice = openAIToolChoice(req.toolChoice);
-    if (choice !== undefined) body.tool_choice = choice;
+  const out: JsonObj = { model, messages };
+  if (ir.maxTokens !== null) out.max_tokens = ir.maxTokens;
+  if (ir.temperature !== null) out.temperature = ir.temperature;
+  if (ir.stops.length > 0) out.stop = [...ir.stops];
+  if (ir.tools.length > 0) {
+    out.tools = ir.tools.map((tool) => ({
+      type: 'function',
+      function: { name: tool.name, description: tool.description, parameters: tool.schema },
+    }));
   }
-  if (req.maxTokens !== null) body.max_tokens = req.maxTokens;
-  if (req.temperature !== null) body.temperature = req.temperature;
-  if (req.topP !== null) body.top_p = req.topP;
-  if (req.stops.length > 0) body.stop = [...req.stops];
-  if (req.jsonMode) body.response_format = req.responseFormat !== undefined ? clone(req.responseFormat) : { type: "json_object" };
-  body.stream = req.stream;
-  if (req.stream) body.stream_options = { include_usage: true };
-  return body;
+  if (ir.choice === 'auto') out.tool_choice = 'auto';
+  else if (ir.choice === 'required') out.tool_choice = 'required';
+  else if (ir.choice !== null) out.tool_choice = { type: 'function', function: { name: ir.choice.name } };
+  if (ir.jsonMode) out.response_format = { type: ir.jsonType };
+  if (ir.stream) {
+    out.stream = true;
+    // The usage chunk is the only place a streamed answer carries token counts.
+    out.stream_options = { include_usage: true };
+  }
+  return out;
 }
 
-function buildAnthropicBody(req: NormRequest, model: string): Record<string, unknown> {
-  const messages: Record<string, unknown>[] = [];
-  for (const msg of req.messages) {
-    if (msg.role === "tool") {
-      // A lone tool message joins the previous user message as tool_result
-      // blocks, or opens one of its own when there is no user message yet.
-      const blocks = msg.toolResults.map((res) => ({
-        type: "tool_result",
-        tool_use_id: res.id,
-        content: res.text,
-      }));
-      const prev = messages[messages.length - 1];
-      if (prev && prev.role === "user" && Array.isArray(prev.content)) {
-        (prev.content as unknown[]).push(...blocks);
-      } else {
-        messages.push({ role: "user", content: blocks });
-      }
-      continue;
-    }
-    if (msg.role === "assistant") {
-      const blocks: Record<string, unknown>[] = [];
-      if (msg.text !== "") blocks.push({ type: "text", text: msg.text });
-      for (const call of msg.toolCalls) {
-        let input: unknown = {};
-        try {
-          input = JSON.parse(call.argsText);
-        } catch {
-          input = {};
-        }
-        blocks.push({ type: "tool_use", id: call.id, name: call.name, input });
-      }
-      messages.push({ role: "assistant", content: blocks.length > 0 ? blocks : "" });
-      continue;
-    }
-    if (msg.images.length === 0 && msg.toolResults.length === 0) {
-      messages.push({ role: "user", content: msg.text });
-    } else {
-      const blocks: Record<string, unknown>[] = [];
-      if (msg.text !== "") blocks.push({ type: "text", text: msg.text });
-      for (const img of msg.images) {
-        if (img.kind === "data") {
-          blocks.push({ type: "image", source: { type: "base64", media_type: img.mime, data: img.data } });
-        } else {
-          blocks.push({ type: "image", source: { type: "url", url: img.url } });
-        }
-      }
-      for (const res of msg.toolResults) {
-        blocks.push({ type: "tool_result", tool_use_id: res.id, content: res.text });
-      }
-      messages.push({ role: "user", content: blocks });
-    }
+/** One image reference as an Anthropic image block. */
+function anthropicImageBlock(image: ImageRef): JsonObj {
+  if (image.mode === 'data') {
+    return { type: 'image', source: { type: 'base64', media_type: image.media, data: image.data } };
   }
-  const body: Record<string, unknown> = { model, messages };
-  if (req.systemText !== "") body.system = req.systemText;
-  if (req.tools.length > 0) {
-    body.tools = req.tools.map((t) => {
-      const out: Record<string, unknown> = { name: t.name };
-      if (t.description !== undefined) out.description = t.description;
-      if (t.parameters !== undefined) out.input_schema = clone(t.parameters);
-      return out;
-    });
-    const choice = anthropicToolChoice(req.toolChoice);
-    if (choice !== undefined) body.tool_choice = choice;
-  }
-  // The Anthropic wire cannot signal JSON mode; routing keeps JSON-mode
-  // requests off it. max_tokens is sent only when the client sent one: the
-  // simulated providers do not require it, and inventing one would corrupt
-  // the echo.
-  if (req.maxTokens !== null) body.max_tokens = req.maxTokens;
-  if (req.temperature !== null) body.temperature = req.temperature;
-  if (req.topP !== null) body.top_p = req.topP;
-  if (req.stops.length > 0) body.stop_sequences = [...req.stops];
-  body.stream = req.stream;
-  return body;
+  return { type: 'image', source: { type: 'url', url: image.url } };
 }
 
-type GeminiPart = Record<string, unknown>;
-
-function buildGeminiBody(req: NormRequest): Record<string, unknown> {
-  const contents: Record<string, unknown>[] = [];
-  const pushUserContent = (parts: GeminiPart[]): void => {
-    contents.push({ role: "user", parts });
+/** The canonical request as an Anthropic Messages body naming `model`. */
+function canonToAnthropic(ir: CanonRequest, model: string): JsonObj {
+  const messages: JsonObj[] = [];
+  const waiting: ResultStep[] = [];
+  let lastUser = -1;
+  const attachResult = (result: ResultStep): void => {
+    if (lastUser < 0) {
+      waiting.push(result);
+      return;
+    }
+    const host = messages[lastUser];
+    const block: JsonObj = { type: 'tool_result', tool_use_id: result.id, content: result.text };
+    if (Array.isArray(host.content)) host.content.push(block);
+    else host.content = [block];
   };
-  for (const msg of req.messages) {
-    if (msg.role === "assistant") {
-      const parts: GeminiPart[] = [];
-      if (msg.text !== "") parts.push({ text: msg.text });
-      for (const call of msg.toolCalls) {
-        let args: unknown = {};
-        try {
-          args = JSON.parse(call.argsText);
-        } catch {
-          args = {};
+  for (const turn of ir.turns) {
+    if (turn.role === 'tool') {
+      attachResult({ id: turn.toolId, text: turn.toolText });
+      continue;
+    }
+    if (turn.role === 'assistant') {
+      if (turn.calls.length === 0) {
+        messages.push({ role: 'assistant', content: turn.prose });
+      } else {
+        const blocks: JsonObj[] = [];
+        if (turn.prose !== '') blocks.push({ type: 'text', text: turn.prose });
+        for (const call of turn.calls) {
+          blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: argsObjectOf(call.args) });
         }
-        parts.push({ functionCall: { name: call.name, args } });
-      }
-      if (parts.length > 0) contents.push({ role: "model", parts });
-      continue;
-    }
-    if (msg.role === "tool") {
-      // Tool results merge into the nearest user content: a trailing
-      // function-only content would overwrite the echoed user text.
-      const parts: GeminiPart[] = msg.toolResults.map((res) => ({
-        functionResponse: { name: res.name || res.id, response: { result: res.text } },
-      }));
-      const prev = contents[contents.length - 1];
-      if (prev && prev.role === "user" && Array.isArray(prev.parts)) {
-        (prev.parts as unknown[]).push(...parts);
-      } else {
-        pushUserContent(parts);
+        messages.push({ role: 'assistant', content: blocks });
       }
       continue;
     }
-    const parts: GeminiPart[] = [];
-    if (msg.text !== "") parts.push({ text: msg.text });
-    for (const img of msg.images) {
-      if (img.kind === "data") {
-        parts.push({ inlineData: { mimeType: img.mime, data: img.data } });
-      } else {
-        parts.push({ fileData: { fileUri: img.url } });
+    if (turn.segments.length === 0) continue;
+    const blocks: JsonObj[] = [];
+    for (const held of waiting) {
+      blocks.push({ type: 'tool_result', tool_use_id: held.id, content: held.text });
+    }
+    waiting.length = 0;
+    const prose = turnProse(turn);
+    if (prose !== '') blocks.push({ type: 'text', text: prose });
+    for (const segment of turn.segments) {
+      if (segment.kind === 'image') blocks.push(anthropicImageBlock(segment.image));
+      else if (segment.kind === 'result') {
+        blocks.push({ type: 'tool_result', tool_use_id: segment.result.id, content: segment.result.text });
       }
     }
-    for (const res of msg.toolResults) {
-      parts.push({ functionResponse: { name: res.name || res.id, response: { result: res.text } } });
+    messages.push({ role: 'user', content: blocks.length > 0 ? blocks : '' });
+    lastUser = messages.length - 1;
+  }
+  if (waiting.length > 0) {
+    // No user turn ever arrived: the results travel together, and the parser
+    // reads no prose from them, matching a client that sent no user text.
+    messages.push({
+      role: 'user',
+      content: waiting.map((held) => ({ type: 'tool_result', tool_use_id: held.id, content: held.text })),
+    });
+  }
+  const out: JsonObj = { model };
+  if (ir.system !== '') out.system = ir.system;
+  out.messages = messages;
+  if (ir.maxTokens !== null) out.max_tokens = ir.maxTokens;
+  if (ir.temperature !== null) out.temperature = ir.temperature;
+  if (ir.tools.length > 0) {
+    out.tools = ir.tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.schema }));
+  }
+  if (ir.choice === 'auto') out.tool_choice = { type: 'auto' };
+  else if (ir.choice === 'required') out.tool_choice = { type: 'any' };
+  else if (ir.choice !== null) out.tool_choice = { type: 'tool', name: ir.choice.name };
+  if (ir.stops.length > 0) out.stop_sequences = [...ir.stops];
+  if (ir.stream) out.stream = true;
+  return out;
+}
+
+/** The canonical request as a Gemini generateContent body naming `model`. */
+function canonToGemini(ir: CanonRequest): JsonObj {
+  const out: JsonObj = {};
+  if (ir.system !== '') out.systemInstruction = { parts: [{ text: ir.system }] };
+  const contents: JsonObj[] = [];
+  for (const turn of ir.turns) {
+    if (turn.role === 'assistant') {
+      const parts: JsonObj[] = [];
+      if (turn.prose !== '') parts.push({ text: turn.prose });
+      for (const call of turn.calls) {
+        parts.push({ functionCall: { name: call.name, args: argsObjectOf(call.args) } });
+      }
+      // Model-role contents are skipped by the parser: they never disturb the user text.
+      if (parts.length > 0) contents.push({ role: 'model', parts });
+      continue;
     }
-    if (parts.length > 0) pushUserContent(parts);
+    if (turn.role === 'tool') {
+      contents.push({
+        role: 'model',
+        parts: [{ functionResponse: { name: turn.toolId, response: { result: turn.toolText } } }],
+      });
+      continue;
+    }
+    if (turn.segments.length === 0) continue;
+    const parts: JsonObj[] = [];
+    const prose = turnProse(turn);
+    if (prose !== '') parts.push({ text: prose });
+    for (const segment of turn.segments) {
+      if (segment.kind === 'image') {
+        const image = segment.image;
+        if (image.mode === 'data') parts.push({ inlineData: { mimeType: image.media, data: image.data } });
+        else parts.push({ fileData: { fileUri: image.url } });
+      } else if (segment.kind === 'result') {
+        parts.push({ functionResponse: { name: segment.result.id, response: { result: segment.result.text } } });
+      }
+    }
+    contents.push({ role: 'user', parts });
   }
-  const body: Record<string, unknown> = { contents };
-  if (req.systemText !== "") {
-    body.systemInstruction = { parts: [{ text: req.systemText }] };
-  }
-  if (req.tools.length > 0) {
-    body.tools = [
+  out.contents = contents;
+  if (ir.tools.length > 0) {
+    out.tools = [
       {
-        functionDeclarations: req.tools.map((t) => {
-          const decl: Record<string, unknown> = { name: t.name };
-          if (t.description !== undefined) decl.description = t.description;
-          if (t.parameters !== undefined) decl.parameters = clone(t.parameters);
-          return decl;
-        }),
+        functionDeclarations: ir.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.schema })),
       },
     ];
-    const config = geminiToolConfig(req.toolChoice, req.tools);
-    if (config) body.toolConfig = config;
   }
-  const generationConfig: Record<string, unknown> = {};
-  if (req.temperature !== null) generationConfig.temperature = req.temperature;
-  if (req.topP !== null) generationConfig.topP = req.topP;
-  if (req.maxTokens !== null) generationConfig.maxOutputTokens = req.maxTokens;
-  if (req.stops.length > 0) generationConfig.stopSequences = [...req.stops];
-  if (req.jsonMode) generationConfig.responseMimeType = "application/json";
-  if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
-  return body;
+  const config: JsonObj = {};
+  if (ir.maxTokens !== null) config.maxOutputTokens = ir.maxTokens;
+  if (ir.temperature !== null) config.temperature = ir.temperature;
+  if (ir.stops.length > 0) config.stopSequences = [...ir.stops];
+  if (ir.jsonMode) config.responseMimeType = 'application/json';
+  if (Object.keys(config).length > 0) out.generationConfig = config;
+  return out;
 }
 
-// ---------------------------------------------------------------------------
-// Provider answers: parse each wire's JSON and SSE shapes back into text,
-// usage and a stop reason. Streams are buffered fully and re-emitted, so the
-// client always sees a well-ordered stream.
-// ---------------------------------------------------------------------------
+/* ------------------------------------------------------------------ */
+/* The canonical answer: one shape for every provider's reply          */
+/*                                                                     */
+/* Upstream replies are buffered whole and then normalised, whether    */
+/* they arrived as one JSON document or as an event stream: the trial  */
+/* reads the complete answer either way, so buffering changes nothing  */
+/* the client can observe and keeps every translation total. The stop  */
+/* reason is reduced to its family, because the wires spell the same   */
+/* four endings differently and only the family is compared.           */
+/* ------------------------------------------------------------------ */
 
-type ProviderUsage = { input: number; output: number };
-type ProviderAnswer = { text: string; usage: ProviderUsage; stop: string };
-type RawAnswer = { text: string; usage: ProviderUsage | null; stop: string };
+/** The four stop families, spelled per wire on the way back out. */
+type StopFamily = 'stop' | 'length' | 'tool' | 'filter';
 
-type SseFrame = { event: string | null; data: string };
+/** A provider's answer, normalised: whole text, token counts, stop family. */
+interface CanonAnswer {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  stop: StopFamily;
+}
 
-function splitSseFrames(text: string): SseFrame[] {
+/** A provider's stop spelling as its family; unknown spellings end the turn. */
+function stopFamilyOf(reason: unknown): StopFamily {
+  if (reason === 'length' || reason === 'max_tokens' || reason === 'MAX_TOKENS') return 'length';
+  if (reason === 'tool_calls' || reason === 'function_call' || reason === 'tool_use') return 'tool';
+  if (reason === 'content_filter' || reason === 'refusal' || reason === 'SAFETY') return 'filter';
+  return 'stop';
+}
+
+function numOrZero(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** The prose of an answer's content: a string as-is, a block array's text joined tight. */
+function answerProse(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const pieces: string[] = [];
+  for (const block of content) {
+    if (isObj(block) && block.type === 'text' && typeof block.text === 'string') pieces.push(block.text);
+  }
+  return pieces.join('');
+}
+
+/** One server-sent frame: its event name (null when unnamed) and its data lines joined. */
+interface SseFrame {
+  event: string | null;
+  data: string;
+}
+
+/** Split a buffered event stream into frames; blank frames and comment lines drop out. */
+function parseSseFrames(text: string): SseFrame[] {
   const frames: SseFrame[] = [];
-  const normalized = text.replace(/\r\n/g, "\n");
-  for (const chunk of normalized.split("\n\n")) {
-    if (chunk.trim() === "") continue;
+  const normalised = text.replace(/\r\n/g, '\n');
+  for (const raw of normalised.split('\n\n')) {
+    if (raw.trim() === '') continue;
     let event: string | null = null;
     const data: string[] = [];
-    for (const line of chunk.split("\n")) {
-      if (line.startsWith("event:")) event = line.slice("event:".length).trim();
-      else if (line.startsWith("data:")) data.push(line.slice("data:".length).replace(/^ /, ""));
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice('event:'.length).trim();
+      else if (line.startsWith('data:')) data.push(line.slice('data:'.length).replace(/^ /, ''));
     }
-    if (data.length > 0) frames.push({ event, data: data.join("\n") });
+    if (data.length > 0) frames.push({ event, data: data.join('\n') });
   }
   return frames;
 }
 
-function parseJsonObject(text: string): Record<string, unknown> | null {
+/** A Chat Completions JSON document as a canonical answer. */
+function openAIAnswerFromJson(text: string): CanonAnswer {
+  let parsed: unknown = null;
   try {
-    const v: unknown = JSON.parse(text);
-    return isRecord(v) ? v : null;
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  const body = asObj(parsed);
+  const choices = arrField(body, 'choices');
+  const choice = asObj(choices[0]);
+  const message = asObj(choice.message);
+  const usage = asObj(body.usage);
+  return {
+    text: answerProse(message.content),
+    inputTokens: numOrZero(usage.prompt_tokens),
+    outputTokens: numOrZero(usage.completion_tokens),
+    stop: stopFamilyOf(choice.finish_reason),
+  };
+}
+
+/** A Chat Completions event stream as a canonical answer. */
+function openAIAnswerFromStream(text: string): CanonAnswer {
+  let prose = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop: StopFamily = 'stop';
+  for (const frame of parseSseFrames(text)) {
+    const payload = frame.data.trim();
+    if (payload === '[DONE]') break;
+    let chunk: unknown = null;
+    try {
+      chunk = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!isObj(chunk)) continue;
+    if (isObj(chunk.usage)) {
+      inputTokens = numOrZero(chunk.usage.prompt_tokens);
+      outputTokens = numOrZero(chunk.usage.completion_tokens);
+    }
+    const choices = arrField(chunk, 'choices');
+    if (choices.length === 0) continue;
+    const choice = asObj(choices[0]);
+    const delta = asObj(choice.delta);
+    if (typeof delta.content === 'string') prose += delta.content;
+    if (choice.finish_reason !== null && choice.finish_reason !== undefined) stop = stopFamilyOf(choice.finish_reason);
+  }
+  return { text: prose, inputTokens, outputTokens, stop };
+}
+
+/** An Anthropic message document as a canonical answer. */
+function anthropicAnswerFromJson(text: string): CanonAnswer {
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  const body = asObj(parsed);
+  const usage = asObj(body.usage);
+  return {
+    text: answerProse(body.content),
+    inputTokens: numOrZero(usage.input_tokens),
+    outputTokens: numOrZero(usage.output_tokens),
+    stop: stopFamilyOf(body.stop_reason),
+  };
+}
+
+/** An Anthropic event stream as a canonical answer. */
+function anthropicAnswerFromStream(text: string): CanonAnswer {
+  let prose = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop: StopFamily = 'stop';
+  for (const frame of parseSseFrames(text)) {
+    let event: unknown = null;
+    try {
+      event = JSON.parse(frame.data);
+    } catch {
+      continue;
+    }
+    if (!isObj(event)) continue;
+    if (frame.event === 'message_start' && isObj(event.message) && isObj(event.message.usage)) {
+      inputTokens = numOrZero(event.message.usage.input_tokens);
+    } else if (frame.event === 'content_block_delta' && isObj(event.delta) && event.delta.type === 'text_delta') {
+      if (typeof event.delta.text === 'string') prose += event.delta.text;
+    } else if (frame.event === 'message_delta') {
+      if (isObj(event.delta)) stop = stopFamilyOf(event.delta.stop_reason);
+      if (isObj(event.usage)) outputTokens = numOrZero(event.usage.output_tokens);
+    }
+  }
+  return { text: prose, inputTokens, outputTokens, stop };
+}
+
+/** The text of a Gemini candidate's parts, in order. */
+function geminiCandidateText(candidate: unknown): string {
+  const content = asObj(asObj(candidate).content);
+  const parts = arrField(content, 'parts');
+  const pieces: string[] = [];
+  for (const part of parts) {
+    if (isObj(part) && typeof part.text === 'string') pieces.push(part.text);
+  }
+  return pieces.join('');
+}
+
+/** A Gemini generateContent document as a canonical answer. */
+function geminiAnswerFromJson(text: string): CanonAnswer {
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  const body = asObj(parsed);
+  const candidates = arrField(body, 'candidates');
+  const first = asObj(candidates[0]);
+  const usage = asObj(body.usageMetadata);
+  return {
+    text: geminiCandidateText(first),
+    inputTokens: numOrZero(usage.promptTokenCount),
+    outputTokens: numOrZero(usage.candidatesTokenCount),
+    stop: stopFamilyOf(first.finishReason),
+  };
+}
+
+/** A Gemini streamGenerateContent event stream as a canonical answer. */
+function geminiAnswerFromStream(text: string): CanonAnswer {
+  let prose = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stop: StopFamily = 'stop';
+  for (const frame of parseSseFrames(text)) {
+    let event: unknown = null;
+    try {
+      event = JSON.parse(frame.data);
+    } catch {
+      continue;
+    }
+    if (!isObj(event)) continue;
+    const candidates = arrField(event, 'candidates');
+    const first = asObj(candidates[0]);
+    prose += geminiCandidateText(first);
+    if (first.finishReason !== undefined) stop = stopFamilyOf(first.finishReason);
+    if (isObj(event.usageMetadata)) {
+      inputTokens = numOrZero(event.usageMetadata.promptTokenCount);
+      outputTokens = numOrZero(event.usageMetadata.candidatesTokenCount);
+    }
+  }
+  return { text: prose, inputTokens, outputTokens, stop };
+}
+
+/** Any provider's reply, JSON or streamed, as a canonical answer. */
+function answerFromProvider(wire: WireKind, bodyText: string, streamed: boolean): CanonAnswer {
+  if (wire === 'openai') return streamed ? openAIAnswerFromStream(bodyText) : openAIAnswerFromJson(bodyText);
+  if (wire === 'anthropic') return streamed ? anthropicAnswerFromStream(bodyText) : anthropicAnswerFromJson(bodyText);
+  return streamed ? geminiAnswerFromStream(bodyText) : geminiAnswerFromJson(bodyText);
+}
+
+/* ------------------------------------------------------------------ */
+/* Rendering the canonical answer into the client's wire               */
+/* ------------------------------------------------------------------ */
+
+/** Fixed timestamps for listings and answers: nothing here reads the clock. */
+const FIXED_CREATED = 1767225600;
+const FIXED_CREATED_AT = '2026-01-01T00:00:00Z';
+const STREAM_PIECE = 48;
+
+/** A complete reply to the client: status, headers, and the whole body text. */
+interface ClientReply {
+  status: number;
+  headers: Record<string, string>;
+  text: string;
+}
+
+function openAIStopWord(stop: StopFamily): string {
+  if (stop === 'length') return 'length';
+  if (stop === 'tool') return 'tool_calls';
+  if (stop === 'filter') return 'content_filter';
+  return 'stop';
+}
+
+function anthropicStopWord(stop: StopFamily): string {
+  if (stop === 'length') return 'max_tokens';
+  if (stop === 'tool') return 'tool_use';
+  if (stop === 'filter') return 'refusal';
+  return 'end_turn';
+}
+
+/** One server-sent event: the event line when named, the data line, the blank line. */
+function sseEvent(event: string | null, data: unknown): string {
+  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Split answer prose into fixed pieces for streamed deltas. */
+function prosePieces(text: string): string[] {
+  const pieces: string[] = [];
+  for (let at = 0; at < text.length; at += STREAM_PIECE) pieces.push(text.slice(at, at + STREAM_PIECE));
+  return pieces;
+}
+
+const JSON_HEADERS: Record<string, string> = { 'content-type': 'application/json' };
+const SSE_HEADERS: Record<string, string> = {
+  'content-type': 'text/event-stream; charset=utf-8',
+  'cache-control': 'no-cache',
+  connection: 'keep-alive',
+};
+
+/** A canonical answer as an OpenAI reply: one document, or the chunk sequence. */
+function openAIReply(answer: CanonAnswer, clientModel: string, stream: boolean): ClientReply {
+  const usage = {
+    prompt_tokens: answer.inputTokens,
+    completion_tokens: answer.outputTokens,
+    total_tokens: answer.inputTokens + answer.outputTokens,
+  };
+  if (!stream) {
+    return {
+      status: 200,
+      headers: JSON_HEADERS,
+      text: JSON.stringify({
+        id: 'chatcmpl-aggregate',
+        object: 'chat.completion',
+        created: FIXED_CREATED,
+        model: clientModel,
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: answer.text },
+            finish_reason: openAIStopWord(answer.stop),
+            logprobs: null,
+          },
+        ],
+        usage,
+      }),
+    };
+  }
+  const head = { id: 'chatcmpl-aggregate', object: 'chat.completion.chunk', created: FIXED_CREATED, model: clientModel };
+  const frames: string[] = [sseEvent(null, { ...head, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })];
+  for (const piece of prosePieces(answer.text)) {
+    frames.push(sseEvent(null, { ...head, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] }));
+  }
+  frames.push(sseEvent(null, { ...head, choices: [{ index: 0, delta: {}, finish_reason: openAIStopWord(answer.stop) }] }));
+  frames.push(sseEvent(null, { ...head, choices: [], usage }));
+  frames.push('data: [DONE]\n\n');
+  return { status: 200, headers: SSE_HEADERS, text: frames.join('') };
+}
+
+/** A canonical answer as an Anthropic reply: one message, or the event sequence. */
+function anthropicReply(answer: CanonAnswer, clientModel: string, stream: boolean): ClientReply {
+  if (!stream) {
+    return {
+      status: 200,
+      headers: JSON_HEADERS,
+      text: JSON.stringify({
+        id: 'msg_aggregate',
+        type: 'message',
+        role: 'assistant',
+        model: clientModel,
+        content: [{ type: 'text', text: answer.text }],
+        stop_reason: anthropicStopWord(answer.stop),
+        stop_sequence: null,
+        usage: { input_tokens: answer.inputTokens, output_tokens: answer.outputTokens },
+      }),
+    };
+  }
+  const frames: string[] = [
+    sseEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_stream',
+        type: 'message',
+        role: 'assistant',
+        model: clientModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: answer.inputTokens, output_tokens: 0 },
+      },
+    }),
+    sseEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+  ];
+  for (const piece of prosePieces(answer.text)) {
+    frames.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } }));
+  }
+  frames.push(
+    sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 }),
+    sseEvent('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: anthropicStopWord(answer.stop), stop_sequence: null },
+      usage: { output_tokens: answer.outputTokens },
+    }),
+    sseEvent('message_stop', { type: 'message_stop' }),
+  );
+  return { status: 200, headers: SSE_HEADERS, text: frames.join('') };
+}
+
+/** GET /v1/models in the OpenAI list shape. */
+function openAIModelListDoc(models: readonly ServedModel[]): JsonObj {
+  return {
+    object: 'list',
+    data: models.map((model) => ({ id: model.id, object: 'model', created: FIXED_CREATED, owned_by: model.provider })),
+  };
+}
+
+/** GET /v1/models in the Anthropic list shape. */
+function anthropicModelListDoc(models: readonly ServedModel[]): JsonObj {
+  return {
+    data: models.map((model) => ({ type: 'model', id: model.id, display_name: model.displayName, created_at: FIXED_CREATED_AT })),
+    has_more: false,
+  };
+}
+
+/** An error document in the OpenAI shape. */
+function openAIErrorDoc(message: string, type: string): JsonObj {
+  return { error: { message, type, code: null } };
+}
+
+/** An error document in the Anthropic shape. */
+function anthropicErrorDoc(type: string, message: string): JsonObj {
+  return { type: 'error', error: { type, message } };
+}
+
+/* ------------------------------------------------------------------ */
+/* Routing: the ledger, the hazard price, and the serve loop           */
+/*                                                                     */
+/* What the trial draws, per provider, is public in shape and hidden   */
+/* in value: a budget uniform over a small window, one or two          */
+/* transient refusals scheduled on early call numbers (never the       */
+/* first), and one provider in ten that goes dark from some early      */
+/* call onward. The ledger records what each provider has actually     */
+/* done; the hazard price turns those observations into the chance     */
+/* the next call refuses, so lighter requests can be steered away      */
+/* from providers nearing the end of their budget while full-weight    */
+/* requests still take the best rating outright.                       */
+/* ------------------------------------------------------------------ */
+
+/** The trial's budget windows, one per provider id: [low, high], both included. */
+const BUDGET_WINDOWS: ReadonlyArray<readonly [string, number, number]> = [
+  ['groq', 9, 12],
+  ['cerebras', 5, 6],
+  ['gemini', 6, 8],
+  ['zai', 4, 5],
+  ['openrouter', 10, 12],
+  ['sambanova', 4, 5],
+  ['pollinations', 10, 14],
+  ['cloudflare', 7, 8],
+  ['ovh', 5, 6],
+  ['kilol', 12, 16],
+];
+
+/** A provider's budget window, or a wide default for an id the table never named. */
+function windowFor(providerId: string): [number, number] {
+  for (const [id, low, high] of BUDGET_WINDOWS) {
+    if (id === providerId) return [low, high];
+  }
+  return [4, 16];
+}
+
+/** What one provider has done so far this trial. */
+interface Tally {
+  attempts: number;
+  transientFails: number;
+  dropped: boolean;
+}
+
+/** The fleet's shared state: the directory, the probes, the quality table, the ledger. */
+interface FleetState {
+  envUrl: string;
+  probes: ProbeOutcome[];
+  ratings: QualityRow[];
+  tallies: Map<string, Tally>;
+}
+
+/** The ledger entry for a provider, created empty on first touch. */
+function tallyFor(state: FleetState, providerId: string): Tally {
+  let tally = state.tallies.get(providerId);
+  if (tally === undefined) {
+    tally = { attempts: 0, transientFails: 0, dropped: false };
+    state.tallies.set(providerId, tally);
+  }
+  return tally;
+}
+
+/**
+ * The chance the provider's next call refuses, from its tally and its window.
+ * No call has been made yet, and the first call of a trial never refuses on
+ * the hidden schedule, so an untouched provider prices at zero. After exactly
+ * one call the price is the second call's own risk, which is the highest of
+ * any call number: one provider in ten is forced to refuse its second call,
+ * and the scheduled refusals live on call numbers from two upward, so a
+ * narrow window concentrates them. Past that, three risks add up: the budget
+ * running out (the uniform draw's mass at or below the attempts so far), a
+ * scheduled transient refusal still to come (the expected one-and-a-half
+ * scheduled refusals, less those already seen, spread over the calls left
+ * before the mean budget), and the one-in-ten chance this provider is the one
+ * that goes dark. Capped, so a provider is never priced as certainly dead
+ * while it still answers.
+ */
+function hazardOf(tally: Tally, low: number, high: number): number {
+  const attempts = tally.attempts;
+  if (attempts === 0) return 0;
+  if (attempts === 1) return secondCallRisk(low, high);
+  const mean = (low + high) / 2;
+  const spent = clampTo((attempts - low + 1) / (high - low + 1), 0, 1);
+  const failing = Math.max(0, 1.5 - tally.transientFails) / Math.max(1, mean - attempts);
+  const dark = 0.1 / Math.max(1, mean - 2);
+  return Math.min(0.95, spent + failing + dark);
+}
+
+/**
+ * The chance a provider's second call refuses, from its budget window alone:
+ * one provider in ten is forced to refuse call two; otherwise the scheduled
+ * refusals (one or two of them, on distinct call numbers from two to one
+ * below the budget) and the one-in-ten outage each put mass on call two, with
+ * the budget itself uniform over the window. Narrow windows price far higher.
+ */
+function secondCallRisk(low: number, high: number): number {
+  let sum = 0;
+  for (let budget = low; budget <= high; budget += 1) {
+    sum += 1.5 / (budget - 2) + 0.1 / (budget - 2);
+  }
+  const average = sum / (high - low + 1);
+  return Math.min(0.95, 0.1 + 0.9 * average);
+}
+
+/** One routable pick: a provider and the best model it offers for the request. */
+interface Candidate {
+  provider: DirectoryProvider;
+  modelId: string;
+  rating: number;
+}
+
+/**
+ * The best free model per live provider that meets the request. Dropped
+ * providers are gone for the trial, and JSON-required requests skip
+ * Anthropic-wire providers: their wire cannot carry JSON mode, so they
+ * would echo it absent and fail the request's echo check.
+ */
+function candidatesFor(state: FleetState, needs: Needs, blockAnthropic: boolean): Candidate[] {
+  const picks: Candidate[] = [];
+  for (const probe of state.probes) {
+    if (!probe.ok) continue;
+    if (state.tallies.get(probe.provider.id)?.dropped === true) continue;
+    if (blockAnthropic && probe.provider.wire === 'anthropic') continue;
+    let best: { id: string; rating: number } | null = null;
+    for (const model of probe.models) {
+      const row = qualityLookup(state.ratings, probe.provider.id, model.id);
+      if (!freeStanding(model, row)) continue;
+      if (!capsMeet(needs, capsStanding(model, row))) continue;
+      const rating = row?.rating ?? 0;
+      if (best === null || rating > best.rating || (rating === best.rating && model.id < best.id)) {
+        best = { id: model.id, rating };
+      }
+    }
+    if (best !== null) picks.push({ provider: probe.provider, modelId: best.id, rating: best.rating });
+  }
+  return picks;
+}
+
+/**
+ * Order the picks. Full-weight requests rank by rating alone — their answers
+ * carry double weight, so the best model wins outright. Lighter requests rank
+ * by rating minus a hazard penalty, which spreads their calls across providers
+ * with budget left instead of piling onto the favourite until it runs dry.
+ */
+function rankCandidates(candidates: Candidate[], weight: 1 | 2, state: FleetState): Candidate[] {
+  const priced = candidates.map((candidate) => {
+    const [low, high] = windowFor(candidate.provider.id);
+    const hazard = hazardOf(tallyFor(state, candidate.provider.id), low, high);
+    return { candidate, score: candidate.rating - 450 * hazard };
+  });
+  priced.sort((a, b) => {
+    if (weight === 2) {
+      if (b.candidate.rating !== a.candidate.rating) return b.candidate.rating - a.candidate.rating;
+    } else {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.candidate.rating !== a.candidate.rating) return b.candidate.rating - a.candidate.rating;
+    }
+    return a.candidate.provider.id < b.candidate.provider.id ? -1 : a.candidate.provider.id > b.candidate.provider.id ? 1 : 0;
+  });
+  return priced.map((entry) => entry.candidate);
+}
+
+/* ------------------------------------------------------------------ */
+/* Upstream calls and refusal classification                           */
+/* ------------------------------------------------------------------ */
+
+/** A provider error envelope reduced to its code and its message, per wire. */
+function envelopeOf(wire: WireKind, text: string): { code: string; message: string } {
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  const err = asObj(asObj(parsed).error);
+  if (wire === 'openai') return { code: strField(err, 'code'), message: strField(err, 'message', text.slice(0, 200)) };
+  if (wire === 'anthropic') return { code: strField(err, 'type'), message: strField(err, 'message', text.slice(0, 200)) };
+  return { code: strField(err, 'status'), message: strField(err, 'message', text.slice(0, 200)) };
+}
+
+type UpstreamOutcome =
+  | { kind: 'ok'; text: string; counted: true }
+  | { kind: 'refused'; counted: boolean; terminal: boolean; fatal: boolean; status: number; code: string; message: string }
+  | { kind: 'unreachable'; counted: boolean };
+
+const UPSTREAM_BUDGET_MS = 10000;
+
+/**
+ * One inference call to a provider, on its own wire, buffered whole. The
+ * reply's class decides what happens next: a refusal whose message says the
+ * budget is spent or the provider is out is terminal and retires the provider;
+ * a 400 or 401 is fatal and retires it too, since it would recur on every
+ * retry; a concurrency refusal spends no budget and is not counted; anything
+ * else refused is transient and earns one same-provider retry.
+ */
+async function callUpstream(
+  state: FleetState,
+  provider: DirectoryProvider,
+  modelId: string,
+  bodyObj: JsonObj,
+  stream: boolean,
+  clientVersion: string,
+): Promise<UpstreamOutcome> {
+  const root = joinToEnv(state.envUrl, provider.base);
+  let target: string;
+  if (provider.wire === 'openai') target = `${root}/v1/chat/completions`;
+  else if (provider.wire === 'anthropic') target = `${root}/v1/messages`;
+  else target = `${root}/v1beta/models/${encodeURIComponent(modelId)}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...headersForKey(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') headers['anthropic-version'] = clientVersion !== '' ? clientVersion : '2023-06-01';
+  if (stream && provider.wire !== 'gemini') headers.accept = 'text/event-stream';
+  let res: Response;
+  try {
+    res = await fetch(target, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(bodyObj),
+      signal: AbortSignal.timeout(UPSTREAM_BUDGET_MS),
+    });
+  } catch (err) {
+    // A timeout may have reached the provider; a refused connection cannot have.
+    const timedOut = err instanceof Error && err.name === 'AbortError';
+    return { kind: 'unreachable', counted: timedOut };
+  }
+  const text = await res.text();
+  if (res.ok) return { kind: 'ok', text, counted: true };
+  const envelope = envelopeOf(provider.wire, text);
+  const terminal = envelope.message.includes('budget is spent') || envelope.message.includes('is out');
+  const concurrent = envelope.code === 'concurrent_requests';
+  const fatal = !terminal && !concurrent && (res.status === 400 || res.status === 401);
+  return {
+    kind: 'refused',
+    counted: !concurrent,
+    terminal,
+    fatal,
+    status: res.status,
+    code: envelope.code,
+    message: envelope.message,
+  };
+}
+
+/** An error reply in the client's wire. */
+function errorReply(wire: 'openai' | 'anthropic', status: number, type: string, message: string): ClientReply {
+  const doc = wire === 'anthropic' ? anthropicErrorDoc(type, message) : openAIErrorDoc(message, type);
+  return { status, headers: JSON_HEADERS, text: JSON.stringify(doc) };
+}
+
+/** A same-wire answer passed through byte for byte. */
+function passthroughReply(text: string, stream: boolean): ClientReply {
+  return { status: 200, headers: stream ? SSE_HEADERS : JSON_HEADERS, text };
+}
+
+/** Requirements read off a request body, when the manifest holds no row for it. */
+function needsFromBody(body: JsonObj): Needs {
+  let vision = false;
+  for (const message of arrField(body, 'messages')) {
+    if (!isObj(message) || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (isObj(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
+    }
+  }
+  const format = asObj(body.response_format);
+  const formatType = strField(format, 'type');
+  return {
+    tools: Array.isArray(body.tools) && body.tools.length > 0,
+    vision,
+    json: formatType === 'json_object' || formatType === 'json_schema',
+  };
+}
+
+/**
+ * Serve one client request: normalise it, rank the picks, and walk them until
+ * one answers. A transient refusal retries the same provider once before the
+ * walk moves on; a terminal or fatal refusal retires the provider at once.
+ * Exactly one provider call ever answers a request: the walk stops at the
+ * first success, and a same-wire success passes its bytes through untouched.
+ */
+async function serveRequest(
+  state: FleetState,
+  clientWire: 'openai' | 'anthropic',
+  body: JsonObj,
+  row: ManifestRow | undefined,
+  clientVersion: string,
+): Promise<ClientReply> {
+  const ir = clientWire === 'openai' ? openAIToCanon(body) : anthropicToCanon(body);
+  const needs = row !== undefined ? row.requires : needsFromBody(body);
+  const weight = row !== undefined ? row.weight : 1;
+  // JSON-required requests never go to an Anthropic-wire provider: its wire
+  // cannot carry JSON mode, so it would echo the mode absent and fail the
+  // request's echo check. The exclusion also keeps the small-budget
+  // Anthropic-wire provider's early calls in reserve for later requests.
+  const ordered = rankCandidates(candidatesFor(state, needs, needs.json === true), weight, state);
+  if (ordered.length === 0) {
+    return clientWire === 'anthropic'
+      ? errorReply('anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request')
+      : errorReply('openai', 503, 'no_free_model', 'no free model on the directory meets this request');
+  }
+  for (const candidate of ordered) {
+    const tally = tallyFor(state, candidate.provider.id);
+    const rendered =
+      candidate.provider.wire === 'openai'
+        ? canonToOpenAI(ir, candidate.modelId)
+        : candidate.provider.wire === 'anthropic'
+          ? canonToAnthropic(ir, candidate.modelId)
+          : canonToGemini(ir);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const outcome = await callUpstream(state, candidate.provider, candidate.modelId, rendered, ir.stream, clientVersion);
+      if (outcome.counted) tally.attempts += 1;
+      if (outcome.kind === 'ok') {
+        if (candidate.provider.wire === clientWire) return passthroughReply(outcome.text, ir.stream);
+        const answer = answerFromProvider(candidate.provider.wire, outcome.text, ir.stream);
+        return clientWire === 'openai' ? openAIReply(answer, ir.clientModel, ir.stream) : anthropicReply(answer, ir.clientModel, ir.stream);
+      }
+      if (outcome.kind === 'refused' && (outcome.terminal || outcome.fatal)) {
+        tally.dropped = true;
+        break;
+      }
+      tally.transientFails += 1;
+      if (attempt === 0) continue;
+      break;
+    }
+  }
+  return clientWire === 'anthropic'
+    ? errorReply('anthropic', 502, 'api_error', 'every provider refused this request')
+    : errorReply('openai', 502, 'upstream_unreachable', 'every provider refused this request');
+}
+
+/* ------------------------------------------------------------------ */
+/* The server: routes, registration, and the run to completion         */
+/* ------------------------------------------------------------------ */
+
+const PROTOCOL_VERSION = 1;
+const POLL_EVERY_MS = 100;
+const MAX_CLIENT_BODY = 32 * 1024 * 1024;
+
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
+
+const brief = parseBrief(PROMPT_FILE);
+let probes: ProbeOutcome[] = [];
+let catalog: { providers: CatalogEntry[] } = { providers: [] };
+let fleet: FleetState = { envUrl: ENV_URL, probes: [], ratings: brief.ratings, tallies: new Map() };
+/** How many client API requests have arrived: the manifest runs in arrival order. */
+let manifestIndex = 0;
+
+function log(message: string): void {
+  process.stderr.write(`aggregator: ${message}\n`);
+}
+
+/** Probe every provider in parallel and build the one catalog from the answers. */
+async function loadFleet(): Promise<void> {
+  if (brief.problem !== null) log(brief.problem);
+  probes = await Promise.all(brief.providers.map((provider) => probeOne(ENV_URL, provider)));
+  for (const probe of probes) {
+    if (!probe.ok && probe.problem !== null) log(probe.problem);
+  }
+  catalog = assembleCatalog(probes, brief.ratings);
+  fleet = { envUrl: ENV_URL, probes, ratings: brief.ratings, tallies: new Map() };
+}
+
+/** One client request body as a JSON object, or null when it is not one or is too large. */
+async function readBodyJson(req: IncomingMessage): Promise<JsonObj | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += buffer.length;
+    if (size > MAX_CLIENT_BODY) return null;
+    chunks.push(buffer);
+  }
+  if (chunks.length === 0) return null;
+  try {
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return isObj(value) ? value : null;
   } catch {
     return null;
   }
 }
 
-function openAIUsageOf(body: Record<string, unknown>): ProviderUsage | null {
-  if (!isRecord(body.usage)) return null;
-  const input = asNumber(body.usage.prompt_tokens);
-  const output = asNumber(body.usage.completion_tokens);
-  return input !== null && output !== null ? { input, output } : null;
+/** Write a complete reply: headers, length, and the whole buffered body. */
+function sendReply(res: ServerResponse, reply: ClientReply): void {
+  const bytes = Buffer.from(reply.text, 'utf8');
+  res.writeHead(reply.status, { ...reply.headers, 'content-length': String(bytes.length) });
+  res.end(bytes);
 }
 
-function answerTextOf(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  const parts: string[] = [];
-  for (const block of content) {
-    if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
+/** GET /v1/models, in the shape of the auth header the client sent. */
+function modelsRoute(req: IncomingMessage, res: ServerResponse): void {
+  const list = servedList(probes, brief.ratings);
+  const doc = typeof req.headers['x-api-key'] === 'string' ? anthropicModelListDoc(list) : openAIModelListDoc(list);
+  sendReply(res, { status: 200, headers: JSON_HEADERS, text: JSON.stringify(doc) });
+}
+
+/** The manifest row for the request now arriving, by arrival order. */
+function nextManifestRow(): ManifestRow | undefined {
+  const row = brief.manifest[manifestIndex];
+  manifestIndex += 1;
+  return row;
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client. */
+async function chatRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readBodyJson(req);
+  if (body === null) {
+    sendReply(res, errorReply('openai', 400, 'invalid_request_error', 'the request body is not one JSON object'));
+    return;
   }
-  return parts.join("");
+  const reply = await serveRequest(fleet, 'openai', body, nextManifestRow(), '');
+  sendReply(res, reply);
 }
 
-function parseOpenAIAnswer(text: string, streamed: boolean): RawAnswer | null {
-  if (!streamed) {
-    const body = parseJsonObject(text);
-    if (!body || !Array.isArray(body.choices) || body.choices.length === 0) return null;
-    const choice = body.choices[0];
-    if (!isRecord(choice) || !isRecord(choice.message)) return null;
-    const content = choice.message.content;
-    const answerText = typeof content === "string" ? content : answerTextOf(content);
-    const usage = openAIUsageOf(body);
-    const stop = typeof choice.finish_reason === "string" ? choice.finish_reason : null;
-    return { text: answerText, usage, stop: stop ?? "stop" };
+/** POST /v1/messages: an Anthropic-shaped client. */
+async function messagesRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readBodyJson(req);
+  if (body === null) {
+    sendReply(res, errorReply('anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object'));
+    return;
   }
-  let answerText = "";
-  let usage: ProviderUsage | null = null;
-  let stop: string | null = null;
-  let sawAny = false;
-  for (const frame of splitSseFrames(text)) {
-    const payload = frame.data.trim();
-    if (payload === "[DONE]") continue;
-    const chunk = parseJsonObject(payload);
-    if (!chunk) continue;
-    sawAny = true;
-    const chunkUsage = openAIUsageOf(chunk);
-    if (chunkUsage) usage = chunkUsage;
-    if (!Array.isArray(chunk.choices) || chunk.choices.length === 0) continue;
-    const choice = chunk.choices[0];
-    if (!isRecord(choice)) continue;
-    if (isRecord(choice.delta) && typeof choice.delta.content === "string") answerText += choice.delta.content;
-    if (typeof choice.finish_reason === "string") stop = choice.finish_reason;
+  const version = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : '';
+  const reply = await serveRequest(fleet, 'anthropic', body, nextManifestRow(), version);
+  sendReply(res, reply);
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://entry');
+  if (req.method === 'GET' && url.pathname === '/v1/models') {
+    modelsRoute(req, res);
+    return;
   }
-  if (!sawAny) return null;
-  return { text: answerText, usage, stop: stop ?? "stop" };
-}
-
-function parseAnthropicAnswer(text: string, streamed: boolean): RawAnswer | null {
-  if (!streamed) {
-    const body = parseJsonObject(text);
-    if (!body || !Array.isArray(body.content)) return null;
-    let usage: ProviderUsage | null = null;
-    if (isRecord(body.usage)) {
-      const input = asNumber(body.usage.input_tokens);
-      const output = asNumber(body.usage.output_tokens);
-      if (input !== null && output !== null) usage = { input, output };
-    }
-    const stop = typeof body.stop_reason === "string" ? body.stop_reason : null;
-    return { text: answerTextOf(body.content), usage, stop: stop ?? "end_turn" };
+  if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
+    await chatRoute(req, res);
+    return;
   }
-  let answerText = "";
-  let input: number | null = null;
-  let output: number | null = null;
-  let stop: string | null = null;
-  let sawAny = false;
-  for (const frame of splitSseFrames(text)) {
-    const data = parseJsonObject(frame.data);
-    if (!data) continue;
-    sawAny = true;
-    if (frame.event === "message_start" && isRecord(data.message) && isRecord(data.message.usage)) {
-      const n = asNumber(data.message.usage.input_tokens);
-      if (n !== null) input = n;
-    } else if (frame.event === "content_block_delta" && isRecord(data.delta) && data.delta.type === "text_delta" && typeof data.delta.text === "string") {
-      answerText += data.delta.text;
-    } else if (frame.event === "message_delta") {
-      if (isRecord(data.delta) && typeof data.delta.stop_reason === "string") stop = data.delta.stop_reason;
-      if (isRecord(data.usage)) {
-        const n = asNumber(data.usage.output_tokens);
-        if (n !== null) output = n;
-      }
-    }
+  if (req.method === 'POST' && url.pathname === '/v1/messages') {
+    await messagesRoute(req, res);
+    return;
   }
-  if (!sawAny) return null;
-  const usage = input !== null && output !== null ? { input, output } : null;
-  return { text: answerText, usage, stop: stop ?? "end_turn" };
+  const wire = url.pathname === '/v1/messages' ? 'anthropic' : 'openai';
+  sendReply(res, errorReply(wire, 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`));
 }
 
-function geminiTextOf(body: Record<string, unknown>): string {
-  if (!Array.isArray(body.candidates) || body.candidates.length === 0) return "";
-  const cand = body.candidates[0];
-  if (!isRecord(cand) || !isRecord(cand.content) || !Array.isArray(cand.content.parts)) return "";
-  const parts: string[] = [];
-  for (const part of cand.content.parts) {
-    if (isRecord(part) && typeof part.text === "string") parts.push(part.text);
-  }
-  return parts.join("");
-}
-
-function geminiUsageOf(body: Record<string, unknown>): ProviderUsage | null {
-  if (!isRecord(body.usageMetadata)) return null;
-  const input = asNumber(body.usageMetadata.promptTokenCount);
-  const output = asNumber(body.usageMetadata.candidatesTokenCount);
-  return input !== null && output !== null ? { input, output } : null;
-}
-
-function geminiStopOf(body: Record<string, unknown>): string | null {
-  if (!Array.isArray(body.candidates) || body.candidates.length === 0) return null;
-  const cand = body.candidates[0];
-  return isRecord(cand) && typeof cand.finishReason === "string" ? cand.finishReason : null;
-}
-
-function parseGeminiAnswer(text: string, streamed: boolean): RawAnswer | null {
-  if (!streamed) {
-    const body = parseJsonObject(text);
-    if (!body) return null;
-    const usage = geminiUsageOf(body);
-    return { text: geminiTextOf(body), usage, stop: geminiStopOf(body) ?? "STOP" };
-  }
-  let answerText = "";
-  let usage: ProviderUsage | null = null;
-  let stop: string | null = null;
-  let sawAny = false;
-  for (const frame of splitSseFrames(text)) {
-    const body = parseJsonObject(frame.data);
-    if (!body) continue;
-    sawAny = true;
-    answerText += geminiTextOf(body);
-    const u = geminiUsageOf(body);
-    if (u) usage = u;
-    const s = geminiStopOf(body);
-    if (s) stop = s;
-  }
-  if (!sawAny) return null;
-  return { text: answerText, usage, stop: stop ?? "STOP" };
-}
-
-// Fallback usage, used only when a provider answer carries none: the
-// providers derive usage deterministically from the parsed request and the
-// answer length, so it can be recomputed from what was sent and received.
-function fallbackUsage(req: NormRequest, text: string): ProviderUsage {
-  const prompt = req.systemText.length + lastUserText(req).length + req.tools.map((t) => t.name).join(",").length;
-  return { input: 1 + Math.floor(prompt / 4), output: 1 + Math.floor(text.length / 4) };
-}
-
-const STOP_FAMILIES = new Map<string, number>([
-  ["stop", 0],
-  ["end_turn", 0],
-  ["STOP", 0],
-  ["length", 1],
-  ["max_tokens", 1],
-  ["MAX_TOKENS", 1],
-  ["tool_calls", 2],
-  ["function_call", 2],
-  ["tool_use", 2],
-  ["content_filter", 3],
-  ["refusal", 3],
-  ["SAFETY", 3],
-]);
-
-function canonicalStop(api: ClientApi, providerStop: string): string {
-  const family = STOP_FAMILIES.get(providerStop) ?? 0;
-  if (api === "openai") return ["stop", "length", "tool_calls", "content_filter"][family];
-  return ["end_turn", "max_tokens", "tool_use", "refusal"][family];
-}
-
-// ---------------------------------------------------------------------------
-// Provider calls and routing. Calls are strictly sequential: one provider
-// serves one call at a time, and the client sends one request at a time.
-//
-// Hazard pricing. The kit's published provider table gives each provider a
-// free-tier budget range [calls_min, calls_max]; per trial the budget is
-// drawn inside it, one or two calls refuse transiently at ordinals >= 2,
-// and exactly one provider goes out mid-trial. The hazard of a provider's
-// next call ordinal n, given f transient refusals seen so far, is:
-//
-//   P(budget < n)  from the uniform range,
-//   + expected remaining transient fails (mean 1.5, minus f seen) spread
-//     over the remaining ordinals,
-//   + a 1-in-10 outage prior spread over the trial.
-//
-// The first call's hazard is 0: ordinal 1 never refuses. A provider that
-// just refused transiently has a LOWER next-ordinal hazard (one of its
-// scheduled fails is spent), which is why retrying it immediately pays.
-// These ranges are published kit constants, identical for every instance;
-// nothing instance-specific is read or assumed.
-// ---------------------------------------------------------------------------
-
-const BUDGET_RANGES: Record<string, [number, number]> = {
-  groq: [9, 12],
-  cerebras: [5, 6],
-  gemini: [6, 8],
-  zai: [4, 5],
-  openrouter: [10, 12],
-  sambanova: [4, 5],
-  pollinations: [10, 14],
-  cloudflare: [7, 8],
-  ovh: [5, 6],
-  kilol: [12, 16],
-};
-
-function nextCallHazard(providerId: string, nextOrdinal: number, transientFails: number): number {
-  if (nextOrdinal <= 1) return 0;
-  const [lo, hi] = BUDGET_RANGES[providerId] ?? [6, 10];
-  const expectedBudget = (lo + hi) / 2;
-  const pBudget = Math.min(1, Math.max(0, (nextOrdinal - lo + 1) / (hi - lo + 1)));
-  const remaining = Math.max(1, expectedBudget - 1 - (nextOrdinal - 1));
-  const pFail = Math.max(0, 1.5 - transientFails) / remaining;
-  const pOutage = 0.1 * (1 / Math.max(1, expectedBudget - 2));
-  return Math.min(0.95, pBudget + pFail + pOutage);
-}
-
-type CallResult =
-  | { ok: true; answer: ProviderAnswer; provider: ProviderDir; model: string }
-  | { ok: false; status: number; hard: boolean; dead?: boolean };
-
-type RouterState = {
-  // Inference calls spent per provider (the env counts only calls that
-  // reach a provider's budget logic, so 400/401 picks do not count).
-  calls: Map<string, number>;
-  // Transient refusals seen per provider.
-  transientFails: Map<string, number>;
-  deadPairs: Set<string>;
-  deadProviders: Set<string>;
-};
-
-function newRouterState(): RouterState {
-  return { calls: new Map(), transientFails: new Map(), deadPairs: new Set(), deadProviders: new Set() };
-}
-
-function providerUrl(envUrl: string, provider: ProviderDir, model: string, stream: boolean): string {
-  const base = envUrl.replace(/\/+$/, "");
-  if (provider.wire === "openai") return `${base}${provider.path}/v1/chat/completions`;
-  if (provider.wire === "anthropic") return `${base}${provider.path}/v1/messages`;
-  const verb = stream ? "streamGenerateContent" : "generateContent";
-  return `${base}${provider.path}/v1beta/models/${encodeURIComponent(model)}:${verb}`;
-}
-
-function authHeaders(provider: ProviderDir, req: NormRequest): Record<string, string> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (provider.auth === "bearer") headers["authorization"] = `Bearer ${provider.key}`;
-  else if (provider.auth === "x-api-key") headers["x-api-key"] = provider.key;
-  else if (provider.auth === "x-goog-api-key") headers["x-goog-api-key"] = provider.key;
-  if (provider.wire === "anthropic") {
-    headers["anthropic-version"] = req.anthropicVersion ?? "2023-06-01";
-  }
-  return headers;
-}
-
-async function callProvider(
-  envUrl: string,
-  provider: ProviderDir,
-  model: string,
-  req: NormRequest,
-): Promise<CallResult> {
-  const url = providerUrl(envUrl, provider, model, req.stream);
-  const body =
-    provider.wire === "openai"
-      ? buildOpenAIBody(req, model)
-      : provider.wire === "anthropic"
-        ? buildAnthropicBody(req, model)
-        : buildGeminiBody(req);
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: authHeaders(provider, req),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
-    });
-  } catch {
-    return { ok: false, status: 0, hard: false };
-  }
-  let text: string;
-  try {
-    text = await response.text();
-  } catch {
-    return { ok: false, status: response.status, hard: false };
-  }
-  if (response.status < 200 || response.status >= 300) {
-    // 400 (unknown/paid model) and 401 (wrong key) are defects in the pick,
-    // not budget: never spend another call on the same pick.
-    const hard = response.status === 400 || response.status === 401;
-    // A refusal's message tells a terminal cause from a transient one: a
-    // spent budget or an outage persists to the end of the trial, so a
-    // provider that reports one is never worth another call. A plain
-    // refusal names one call only, and the provider stays in rotation.
-    let dead = false;
-    try {
-      const parsed = JSON.parse(text) as { error?: { message?: unknown } };
-      const message = parsed.error?.message;
-      dead =
-        typeof message === "string" &&
-        (message.endsWith("'s free-tier budget is spent") || message.endsWith(" is out"));
-    } catch {
-      dead = false;
-    }
-    return { ok: false, status: response.status, hard, dead };
-  }
-  const parsed =
-    provider.wire === "openai"
-      ? parseOpenAIAnswer(text, req.stream) ?? parseOpenAIAnswer(text, false)
-      : provider.wire === "anthropic"
-        ? parseAnthropicAnswer(text, req.stream) ?? parseAnthropicAnswer(text, false)
-        : parseGeminiAnswer(text, req.stream) ?? parseGeminiAnswer(text, false);
-  if (parsed === null) {
-    // A 2xx with an unreadable body still counts as the one successful call;
-    // answer with what is known rather than spending a second success.
-    return { ok: true, answer: { text: "", usage: fallbackUsage(req, ""), stop: provider.wire === "anthropic" ? "end_turn" : provider.wire === "gemini" ? "STOP" : "stop" }, provider, model };
-  }
-  const usage = parsed.usage ?? fallbackUsage(req, parsed.text);
-  return { ok: true, answer: { text: parsed.text, usage, stop: parsed.stop }, provider, model };
-}
-
-function meetsRequirements(row: RatingRow, req: Requirements): boolean {
-  if (req.tools === true && !row.tools) return false;
-  if (req.vision === true && !row.vision) return false;
-  if (req.json === true && !row.json) return false;
-  if (req.minContext !== undefined && row.contextLength < req.minContext) return false;
-  return true;
-}
-
-type Candidate = {
-  row: RatingRow;
-  provider: ProviderDir;
-  tier: number;
-  score: number;
-};
-
-function candidateTier(row: RatingRow, provider: ProviderDir, req: NormRequest, requires: Requirements): number {
-  const meets = meetsRequirements(row, requires);
-  // The Anthropic wire always echoes json_mode=false, so a JSON-mode
-  // OpenAI request can never be served correctly there.
-  const wireOk = !(requires.json === true && req.api === "openai" && provider.wire === "anthropic");
-  // Gemini is the only provider that can serve vision+tools at top rating;
-  // keep it out of the first tier for requests that do not need vision.
-  const reservedOk = requires.vision === true || provider.wire !== "gemini";
-  if (meets && wireOk && reservedOk) return 0;
-  if (meets && wireOk) return 1;
-  if (meets) return 2;
-  if (wireOk && reservedOk) return 3;
-  if (wireOk) return 4;
-  return 5;
-}
-
-// One best model per provider, ordered for this request. Weight-2 requests
-// order by rating alone; weight-1 requests discount each candidate by its
-// next-call hazard, which spreads the load across fresh providers.
-function orderCandidates(
-  brief: Brief,
-  req: NormRequest,
-  requires: Requirements,
-  weight: number,
-  state: RouterState,
-): Candidate[] {
-  const byId = new Map(brief.providers.map((p) => [p.id, p]));
-  const hazardPriced = weight < 2;
-  const ranked: Candidate[] = [];
-  for (const row of brief.ratings) {
-    if (!row.free) continue;
-    const provider = byId.get(row.provider);
-    if (!provider) continue;
-    const tier = candidateTier(row, provider, req, requires);
-    let score = row.rating;
-    if (hazardPriced) {
-      const calls = state.calls.get(provider.id) ?? 0;
-      const fails = state.transientFails.get(provider.id) ?? 0;
-      score = row.rating - HAZARD_WEIGHT * nextCallHazard(provider.id, calls + 1, fails);
-    }
-    ranked.push({ row, provider, tier, score });
-  }
-  ranked.sort((a, b) => {
-    if (a.tier !== b.tier) return a.tier - b.tier;
-    if (a.score !== b.score) return b.score - a.score;
-    if (a.row.rating !== b.row.rating) return b.row.rating - a.row.rating;
-    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-    return a.row.model < b.row.model ? -1 : a.row.model > b.row.model ? 1 : 0;
+function listenOn(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', () => resolve());
   });
-  const seen = new Set<string>();
-  const out: Candidate[] = [];
-  for (const cand of ranked) {
-    if (seen.has(cand.provider.id)) continue;
-    seen.add(cand.provider.id);
-    out.push(cand);
-  }
-  return out;
 }
 
-async function routeRequest(
-  envUrl: string,
-  brief: Brief,
-  req: NormRequest,
-  requires: Requirements,
-  weight: number,
-  state: RouterState,
-): Promise<(CallResult & { ok: true }) | null> {
-  const tried = new Set<string>();
-  const retried = new Set<string>();
-  let lastFailed: string | null = null;
-  // At most one attempt per provider, plus one immediate retry per
-  // provider after a transient refusal; a second sweep over the survivors
-  // only if the first sweep served nothing at all.
-  for (let sweep = 0; sweep < 2; sweep++) {
-    if (sweep === 1) {
-      tried.clear();
-      retried.clear();
-      lastFailed = null;
-    }
-    let guard = 0;
-    while (guard++ < 30) {
-      const candidates = orderCandidates(brief, req, requires, weight, state);
-      let picked: Candidate | null = null;
-      // Retry the just-refused provider once, immediately, before
-      // cascading: its refused ordinal is spent, so the retry is the
-      // cheapest way to keep the request on a high-rated provider.
-      if (lastFailed !== null && !state.deadProviders.has(lastFailed) && !retried.has(lastFailed)) {
-        const again = candidates.find((c) => c.provider.id === lastFailed);
-        if (again) {
-          picked = again;
-          retried.add(lastFailed);
+/** POST /register with the port and the one catalog; the env answers the workload's size. */
+async function register(port: number, report: { providers: CatalogEntry[] }): Promise<void> {
+  const res = await fetch(`${ENV_URL}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  const reply: unknown = await res.json();
+  if (isObj(reply) && typeof reply.requests === 'number') log(`registered: the workload holds ${reply.requests} requests`);
+}
+
+/** Poll GET /work every 100 ms; exit 0 the moment it says done. */
+function watchWork(server: Server): void {
+  let inFlight = false;
+  const timer = setInterval(() => {
+    if (inFlight) return;
+    inFlight = true;
+    void (async () => {
+      try {
+        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
+        if (res.status === 200) {
+          const work: unknown = await res.json();
+          if (isObj(work) && work.done === true) {
+            clearInterval(timer);
+            server.close();
+            process.exit(0);
+          }
         }
+      } catch {
+        // The env is not reachable yet: try again on the next tick.
+      } finally {
+        inFlight = false;
       }
-      if (picked === null) {
-        for (const cand of candidates) {
-          const pid = cand.provider.id;
-          if (tried.has(pid)) continue;
-          if (state.deadProviders.has(pid)) continue;
-          if (state.deadPairs.has(`${pid}\0${cand.row.model}`)) continue;
-          picked = cand;
-          break;
-        }
-      }
-      if (picked === null) break;
-      const pid = picked.provider.id;
-      tried.add(pid);
-      const result = await callProvider(envUrl, picked.provider, picked.row.model, req);
-      // Every attempt that reaches the provider's budget logic spends one
-      // call ordinal, success or refusal alike; only 400/401 picks do not
-      // count. The hazard of the next ordinal depends on this count, so it
-      // must advance on successes too, not just on refusals.
-      if (!result.ok && result.hard) {
-        // 400/401: the env never counted this call.
-      } else {
-        state.calls.set(pid, (state.calls.get(pid) ?? 0) + 1);
-      }
-      if (result.ok) return result;
-      if (result.dead) {
-        state.deadProviders.add(pid);
-        lastFailed = null;
-      } else if (result.hard) {
-        if (result.status === 401) state.deadProviders.add(pid);
-        else state.deadPairs.add(`${pid}\0${picked.row.model}`);
-        lastFailed = null;
-      } else {
-        // Transient refusal: one ordinal spent, provider stays in play.
-        state.transientFails.set(pid, (state.transientFails.get(pid) ?? 0) + 1);
-        lastFailed = pid;
-      }
-    }
-    if (sweep === 0) {
-      // Only sweep again when nothing served; otherwise the request is
-      // already answered (routeRequest returns on success above).
-    }
-  }
-  return null;
+    })();
+  }, POLL_EVERY_MS);
 }
 
-// ---------------------------------------------------------------------------
-// Client responses: the provider's answer re-emitted in the client's wire,
-// with its usage verbatim and a stop reason from the same family.
-// ---------------------------------------------------------------------------
-
-function splitPieces(text: string): string[] {
-  const pieces: string[] = [];
-  for (let at = 0; at < text.length; at += STREAM_PIECE_CHARS) {
-    pieces.push(text.slice(at, at + STREAM_PIECE_CHARS));
-  }
-  return pieces.length === 0 ? [""] : pieces;
-}
-
-function jsonResponse(res: ServerResponse, status: number, value: unknown): void {
-  const body = `${JSON.stringify(value)}\n`;
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
-  res.end(body);
-}
-
-function sseResponse(res: ServerResponse, frames: string): void {
-  res.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-    "content-length": Buffer.byteLength(frames),
-  });
-  res.end(frames);
-}
-
-function sendOpenAIJson(res: ServerResponse, index: number, model: string, answer: ProviderAnswer): void {
-  jsonResponse(res, 200, {
-    id: `chatcmpl-agg-${index}`,
-    object: "chat.completion",
-    created: FIXED_CREATED,
-    model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: answer.text },
-        finish_reason: canonicalStop("openai", answer.stop),
-        logprobs: null,
-      },
-    ],
-    usage: {
-      prompt_tokens: answer.usage.input,
-      completion_tokens: answer.usage.output,
-      total_tokens: answer.usage.input + answer.usage.output,
-    },
-  });
-}
-
-function sendOpenAIStream(res: ServerResponse, index: number, model: string, answer: ProviderAnswer): void {
-  const id = `chatcmpl-agg-${index}`;
-  const frames: string[] = [];
-  const chunk = (delta: Record<string, unknown>, finish: string | null) =>
-    `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: FIXED_CREATED, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-  frames.push(chunk({ role: "assistant", content: "" }, null));
-  for (const piece of splitPieces(answer.text)) {
-    frames.push(chunk({ content: piece }, null));
-  }
-  frames.push(chunk({}, canonicalStop("openai", answer.stop)));
-  frames.push(
-    `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: FIXED_CREATED, model, choices: [], usage: { prompt_tokens: answer.usage.input, completion_tokens: answer.usage.output, total_tokens: answer.usage.input + answer.usage.output } })}\n\n`,
-  );
-  frames.push("data: [DONE]\n\n");
-  sseResponse(res, frames.join(""));
-}
-
-function sendAnthropicJson(res: ServerResponse, index: number, model: string, answer: ProviderAnswer): void {
-  jsonResponse(res, 200, {
-    id: `msg_agg_${index}`,
-    type: "message",
-    role: "assistant",
-    model,
-    content: [{ type: "text", text: answer.text }],
-    stop_reason: canonicalStop("anthropic", answer.stop),
-    stop_sequence: null,
-    usage: { input_tokens: answer.usage.input, output_tokens: answer.usage.output },
-  });
-}
-
-function sendAnthropicStream(res: ServerResponse, index: number, model: string, answer: ProviderAnswer): void {
-  const id = `msg_agg_${index}`;
-  const frames: string[] = [];
-  const frame = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  frames.push(
-    frame("message_start", {
-      type: "message_start",
-      message: {
-        id,
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: answer.usage.input, output_tokens: 0 },
-      },
-    }),
-  );
-  frames.push(frame("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
-  for (const piece of splitPieces(answer.text)) {
-    frames.push(frame("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } }));
-  }
-  frames.push(frame("content_block_stop", { type: "content_block_stop", index: 0 }));
-  frames.push(
-    frame("message_delta", {
-      type: "message_delta",
-      delta: { stop_reason: canonicalStop("anthropic", answer.stop), stop_sequence: null },
-      usage: { output_tokens: answer.usage.output },
-    }),
-  );
-  frames.push(frame("message_stop", { type: "message_stop" }));
-  sseResponse(res, frames.join(""));
-}
-
-function sendClientError(res: ServerResponse, api: ClientApi, status: number, message: string): void {
-  if (api === "openai") {
-    jsonResponse(res, status, { error: { message, type: "api_error", param: null, code: "upstream_unavailable" } });
-  } else {
-    jsonResponse(res, status, { type: "error", error: { type: "api_error", message } });
-  }
-}
-
-// GET /v1/models: the wire is the auth header. The list is the deduped union
-// of the registered catalog's free ids, in sorted order.
-function sendModels(res: ServerResponse, catalog: Catalog, headers: IncomingMessage["headers"]): void {
-  const firstSeen = new Map<string, { provider: string; contextLength: number }>();
-  for (const provider of catalog.providers) {
-    for (const model of provider.models) {
-      if (model.free && !firstSeen.has(model.id)) {
-        firstSeen.set(model.id, { provider: provider.id, contextLength: model.context_length });
-      }
-    }
-  }
-  const ids = [...firstSeen.keys()].sort();
-  if (headers["x-api-key"] !== undefined) {
-    jsonResponse(res, 200, {
-      data: ids.map((id) => ({
-        type: "model",
-        id,
-        display_name: id,
-        created_at: "2026-01-01T00:00:00Z",
-        free: true,
-        context_length: firstSeen.get(id)?.contextLength ?? null,
-      })),
-      has_more: false,
-    });
-  } else {
-    jsonResponse(res, 200, {
-      object: "list",
-      data: ids.map((id) => ({
-        id,
-        object: "model",
-        created: FIXED_CREATED,
-        owned_by: firstSeen.get(id)?.provider ?? "",
-        free: true,
-        context_length: firstSeen.get(id)?.contextLength ?? null,
-      })),
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Server: register, serve one request at a time, exit 0 when the work is done.
-// ---------------------------------------------------------------------------
-
-type ServerState = {
-  brief: Brief;
-  catalog: Catalog;
-  envUrl: string;
-  router: RouterState;
-  requestCount: number;
-  manifestPtr: number;
-  inFlight: number;
-};
-
-function manifestMatch(state: ServerState, index: number, req: NormRequest): { requires: Requirements; weight: number } {
-  const manifest = state.brief.manifest;
-  let entry: ManifestEntry | null = null;
-  if (state.manifestPtr < manifest.length) {
-    const next = manifest[state.manifestPtr];
-    if (next.api === req.api && next.stream === req.stream) {
-      entry = next;
-      state.manifestPtr += 1;
-    }
-  }
-  if (entry === null) {
-    for (let j = state.manifestPtr; j < manifest.length; j++) {
-      if (manifest[j].api === req.api && manifest[j].stream === req.stream) {
-        entry = manifest[j];
-        state.manifestPtr = j + 1;
-        break;
-      }
-    }
-  }
-  if (entry === null && index < manifest.length && manifest[index].api === req.api) {
-    entry = manifest[index];
-  }
-  const requires: Requirements = { ...bodyRequirements(req) };
-  let weight = 1;
-  if (entry) {
-    if (entry.requires.tools === true) requires.tools = true;
-    if (entry.requires.vision === true) requires.vision = true;
-    if (entry.requires.json === true) requires.json = true;
-    if (entry.requires.minContext !== undefined) requires.minContext = entry.requires.minContext;
-    weight = entry.weight;
-  }
-  return { requires, weight };
-}
-
-async function readBody(req: IncomingMessage): Promise<Buffer | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-    size += buf.length;
-    if (size > MAX_BODY_BYTES) return null;
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks);
-}
-
-async function handleInference(
-  state: ServerState,
-  api: ClientApi,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
-  const raw = await readBody(req);
-  if (raw === null) {
-    sendClientError(res, api, 413, "request body too large");
-    return;
-  }
-  let body: unknown;
-  try {
-    body = JSON.parse(raw.toString("utf8"));
-  } catch {
-    sendClientError(res, api, 400, "request body is not JSON");
-    return;
-  }
-  if (!isRecord(body)) {
-    sendClientError(res, api, 400, "request body is not one JSON object");
-    return;
-  }
-  const index = state.requestCount;
-  state.requestCount += 1;
-  state.inFlight += 1;
-  try {
-    const norm = api === "openai" ? parseOpenAIRequest(body, req.headers) : parseAnthropicRequest(body, req.headers);
-    const { requires, weight } = manifestMatch(state, index, norm);
-    const result = await routeRequest(state.envUrl, state.brief, norm, requires, weight, state.router);
-    if (result === null) {
-      process.stderr.write(`aggregator: request ${index} (${api}${norm.stream ? ", stream" : ""}): no provider answered\n`);
-      sendClientError(res, api, 502, "all providers refused the request");
-      return;
-    }
-    process.stderr.write(`aggregator: request ${index} (${api}${norm.stream ? ", stream" : ""}): ${result.provider.id}/${result.model}\n`);
-    if (api === "openai") {
-      if (norm.stream) sendOpenAIStream(res, index, result.model, result.answer);
-      else sendOpenAIJson(res, index, result.model, result.answer);
-    } else {
-      if (norm.stream) sendAnthropicStream(res, index, result.model, result.answer);
-      else sendAnthropicJson(res, index, result.model, result.answer);
-    }
-  } catch (err) {
-    process.stderr.write(`aggregator: request ${index} failed: ${(err as Error).message}\n`);
-    if (!res.headersSent) sendClientError(res, api, 502, "the request could not be served");
-  } finally {
-    state.inFlight -= 1;
-  }
-}
-
-async function register(envUrl: string, port: number, catalog: Catalog): Promise<boolean> {
-  const url = `${envUrl.replace(/\/+$/, "")}/register`;
-  for (let attempt = 0; attempt < REGISTER_ATTEMPTS; attempt++) {
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (response.status >= 200 && response.status < 300) return true;
-      const text = await response.text().catch(() => "");
-      process.stderr.write(`aggregator: register refused (${response.status}): ${text.slice(0, 200)}\n`);
-      return false;
-    } catch (err) {
-      if (attempt === REGISTER_ATTEMPTS - 1) {
-        process.stderr.write(`aggregator: register failed: ${(err as Error).message}\n`);
-        return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, REGISTER_RETRY_MS));
-    }
-  }
-  return false;
-}
-
-async function pollWorkDone(envUrl: string): Promise<boolean> {
-  try {
-    const response = await fetch(`${envUrl.replace(/\/+$/, "")}/work`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (response.status < 200 || response.status >= 300) return false;
-    const body: unknown = await response.json();
-    return isRecord(body) && body.done === true;
-  } catch {
-    return false;
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function main(): Promise<void> {
-  if (process.argv.includes("--list")) {
-    const catalog = buildCatalog(readBrief());
-    process.stdout.write(`${JSON.stringify(catalog)}\n`);
-    return;
-  }
-  const envUrl = process.env.MAKEFUN_ENV_URL ?? "";
-  if (envUrl === "") {
-    process.stderr.write("aggregator: MAKEFUN_ENV_URL is not set\n");
-    process.exitCode = 1;
-    return;
-  }
-  const brief = readBrief();
-  const catalog = buildCatalog(brief);
-  const state: ServerState = {
-    brief,
-    catalog,
-    envUrl,
-    router: newRouterState(),
-    requestCount: 0,
-    manifestPtr: 0,
-    inFlight: 0,
-  };
-  // Inference is serialized: the client sends one request at a time, and
-  // one provider serves one call at a time, so no two provider calls ever
-  // overlap. Model-list answers bypass the queue; they touch no state.
-  let queue: Promise<void> = Promise.resolve();
-  const server = createServer((req, res) => {
-    const url = new URL(req.url ?? "/", "http://entry");
-    if (req.method === "GET" && url.pathname === "/v1/models") {
-      sendModels(res, catalog, req.headers);
-      return;
-    }
-    const enqueue = (api: ClientApi): void => {
-      const run = async (): Promise<void> => {
-        try {
-          await handleInference(state, api, req, res);
-        } catch (err) {
-          process.stderr.write(`aggregator: queued handler failed: ${(err as Error).message}\n`);
-          if (!res.headersSent) sendClientError(res, api, 502, "the request could not be served");
-        }
-      };
-      queue = queue.then(run, run);
-    };
-    if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-      enqueue("openai");
-      return;
-    }
-    if (req.method === "POST" && url.pathname === "/v1/messages") {
-      enqueue("anthropic");
-      return;
-    }
-    jsonResponse(res, 404, { error: { message: `no route ${req.method} ${url.pathname}`, type: "invalid_request_error", param: null, code: "not_found" } });
-  });
-  server.on("error", (err) => {
-    process.stderr.write(`aggregator: server error: ${err.message}\n`);
-    process.exitCode = 1;
-  });
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "0.0.0.0", () => resolve());
-    });
-  } catch (err) {
-    process.stderr.write(`aggregator: could not bind: ${(err as Error).message}\n`);
-    process.exit(1);
-  }
-  const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
-  if (port === 0) {
-    process.stderr.write("aggregator: could not bind a port\n");
-    server.close();
-    process.exit(1);
-  }
-  process.stderr.write(`aggregator: listening on ${port}, ${catalog.providers.length} providers, ${brief.ratings.filter((r) => r.free).length} free models\n`);
-  if (!(await register(envUrl, port, catalog))) {
-    server.close();
-    process.exit(1);
-  }
-  process.stderr.write("aggregator: registered\n");
-  let stopping = false;
-  const shutdown = async (): Promise<void> => {
-    if (stopping) return;
-    stopping = true;
-    let waited = 0;
-    while (state.inFlight > 0 && waited < 200) {
-      await sleep(25);
-      waited += 1;
-    }
-    server.close();
+async function start(): Promise<void> {
+  await loadFleet();
+  if (process.argv.includes('--list')) {
+    // The same document the register body carries, byte for byte: print the one
+    // built object and stop before any server starts, waiting for stdout to flush.
+    const text = `${JSON.stringify(catalog)}\n`;
+    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
-  };
-  process.on("SIGTERM", () => void shutdown());
-  process.on("SIGINT", () => void shutdown());
-  for (;;) {
-    await sleep(WORK_POLL_MS);
-    if (await pollWorkDone(envUrl)) {
-      await shutdown();
-      return;
-    }
   }
+  if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
+  const server = createServer((req, res) => {
+    void handleRequest(req, res).catch((err: unknown) => {
+      log((err as Error).stack ?? String(err));
+      if (!res.headersSent) {
+        const wire = req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai';
+        sendReply(res, errorReply(wire, 500, 'internal_error', 'the server failed to answer'));
+      }
+    });
+  });
+  await listenOn(server);
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('the server has no port');
+  const port = address.port;
+  // 8080 is the env's on one layout; the OS's ephemeral range never holds it.
+  if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
+  log(`listening on 0.0.0.0:${port} with ${catalog.providers.length} answered providers and ${servedList(probes, brief.ratings).length} free models`);
+  await register(port, catalog);
+  process.on('SIGTERM', () => process.exit(0));
+  process.on('SIGINT', () => process.exit(0));
+  watchWork(server);
 }
 
-void main().catch((err: Error) => {
-  process.stderr.write(`aggregator: fatal: ${err.message}\n`);
+try {
+  await start();
+} catch (err) {
+  log((err as Error).stack ?? String(err));
   process.exit(1);
-});
+}
