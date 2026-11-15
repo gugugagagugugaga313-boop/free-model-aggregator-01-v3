@@ -1,0 +1,1 @@
+{"description":"One server serving the OpenAI and Anthropic APIs over ten free-tier providers, routing each request with hazard-priced, weight-aware failover.","name":"free-model-aggregator-01-v3","private":true,"type":"module","version":"3.0.0"}
